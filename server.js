@@ -83,7 +83,7 @@ app.use((_req, res) => {
   });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `Movira backend berjalan di port ${PORT}`
   );
