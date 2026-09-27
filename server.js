@@ -53,7 +53,57 @@ app.get("/api/health", (_req, res) => {
     version: "0.2.0"
   });
 });
+app.get("/api/credits", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
 
+    const accessToken = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : null;
+
+    if (!accessToken) {
+      return res.status(401).json({
+        error: "Silakan login terlebih dahulu."
+      });
+    }
+
+    const {
+      data: { user },
+      error: authError
+    } = await supabase.auth.getUser(accessToken);
+
+    if (authError || !user) {
+      return res.status(401).json({
+        error: "Sesi login tidak valid."
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("user_credits")
+      .select("credits")
+      .eq("user_id", user.id)
+      .single();
+
+    if (error) {
+      console.error("Gagal membaca kredit:", error);
+
+      return res.status(500).json({
+        error: "Gagal membaca kredit."
+      });
+    }
+
+    return res.json({
+      ok: true,
+      credits: data.credits
+    });
+  } catch (error) {
+    console.error("Credit test error:", error);
+
+    return res.status(500).json({
+      error: "Terjadi kesalahan server."
+    });
+  }
+});
 app.post("/api/generate", generateLimiter, async (req, res) => {
   let creditWasConsumed = false;
 let creditUserId = null;
