@@ -55,7 +55,10 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.post("/api/generate", generateLimiter, async (req, res) => {
-  try {
+  let creditWasConsumed = false;
+let creditUserId = null;
+
+try {
    const authHeader = req.headers.authorization || "";
 
 const accessToken = authHeader.startsWith("Bearer ")
@@ -77,7 +80,7 @@ if (authError || !user) {
   return res.status(401).json({
     error: "Sesi login tidak valid."
   });
-}
+}creditUserId = user.id;
     const {
       prompt,
       ratio,
@@ -168,7 +171,25 @@ if (authError || !user) {
         error: "Gambar wajib diberikan."
       });
     }
+const { data: creditConsumed, error: creditError } =
+  await supabase.rpc("consume_credit", {
+    p_user_id: user.id
+  });
 
+if (creditError) {
+  console.error("Gagal memproses kredit:", creditError);
+
+  return res.status(500).json({
+    error: "Gagal memproses kredit."
+  });
+}
+
+if (!creditConsumed) { 
+  return res.status(402).json({
+    error: "Kredit tidak cukup."
+  });
+}
+   creditWasConsumed = true;
     const result = await fal.subscribe(MODEL, {
       input: {
         prompt: prompt.trim(),
@@ -194,7 +215,15 @@ if (authError || !user) {
 
   } catch (error) {
     console.error("Movira generation error:", error);
+if (creditWasConsumed && creditUserId) {
+  const { error: refundError } = await supabase.rpc("refund_credit", {
+    p_user_id: creditUserId
+  });
 
+  if (refundError) {
+    console.error("Gagal mengembalikan kredit:", refundError);
+  }
+}
     return res.status(500).json({
       error: "Gagal membuat video.",
       message: "Terjadi kesalahan saat menghubungi layanan video."
