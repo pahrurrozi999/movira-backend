@@ -56,6 +56,28 @@ app.get("/api/health", (_req, res) => {
 
 app.post("/api/generate", generateLimiter, async (req, res) => {
   try {
+   const authHeader = req.headers.authorization || "";
+
+const accessToken = authHeader.startsWith("Bearer ")
+  ? authHeader.slice(7)
+  : null;
+
+if (!accessToken) {
+  return res.status(401).json({
+    error: "Silakan login terlebih dahulu."
+  });
+}
+
+const {
+  data: { user },
+  error: authError
+} = await supabase.auth.getUser(accessToken);
+
+if (authError || !user) {
+  return res.status(401).json({
+    error: "Sesi login tidak valid."
+  });
+}
     const {
       prompt,
       ratio,
