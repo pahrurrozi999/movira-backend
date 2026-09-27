@@ -3,9 +3,14 @@ import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { fal } from "@fal-ai/client";
+import { createClient } from "@supabase/supabase-js";
 import "dotenv/config";
-
 const app = express();
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 const PORT = Number(process.env.PORT || 3000);
 
 app.use(helmet());
