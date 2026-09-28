@@ -133,7 +133,7 @@ if (!accessToken) {
   });
 }
 
-const {
+ const {
   data: { user },
   error: authError
 } = await supabase.auth.getUser(accessToken);
@@ -149,16 +149,18 @@ if (authError || !user) {
   });
 }
 
-}creditUserId = user.id;
-    const {
-      prompt,
-      ratio,
-      duration,
-      resolution = "720p",
-      imageUrl,
-      imageData,
-      audio = true
-    } = req.body || {};
+creditUserId = user.id;
+
+const {
+  prompt,
+  ratio,
+  duration,
+  resolution = "720p",
+  imageUrl,
+  imageData,
+  audio = true
+} = req.body || {};
+  
 
     if (
       typeof prompt !== "string" ||
