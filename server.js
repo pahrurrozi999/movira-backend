@@ -29,7 +29,6 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"],
   optionsSuccessStatus: 204
 }));
-
 app.use(express.json({ limit: "15mb" }));
 const DEMO_MODE = process.env.DEMO_MODE === "true";
 const generateLimiter = rateLimit({
