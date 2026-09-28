@@ -25,8 +25,11 @@ app.use((req, res, next) => {
 
 app.use(cors({
   origin: process.env.ALLOWED_ORIGIN || "http://localhost:3000",
-  methods: ["GET", "POST"],
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  optionsSuccessStatus: 204
 }));
+
 app.use(express.json({ limit: "15mb" }));
 const DEMO_MODE = process.env.DEMO_MODE === "true";
 const generateLimiter = rateLimit({
