@@ -60,7 +60,10 @@ app.get("/api/credits", async (req, res) => {
     const accessToken = authHeader.startsWith("Bearer ")
       ? authHeader.slice(7)
       : null;
-
+console.log("GET /api/credits", {
+  origin: req.headers.origin,
+  hasAuth: Boolean(accessToken)
+});
     if (!accessToken) {
       return res.status(401).json({
         error: "Silakan login terlebih dahulu."
