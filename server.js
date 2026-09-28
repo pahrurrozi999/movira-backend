@@ -139,9 +139,16 @@ const {
 } = await supabase.auth.getUser(accessToken);
 
 if (authError || !user) {
+  console.error(
+    "SUPABASE AUTH ERROR:",
+    authError?.message || "user tidak ditemukan"
+  );
+
   return res.status(401).json({
     error: "Sesi login tidak valid."
   });
+}
+
 }creditUserId = user.id;
     const {
       prompt,
