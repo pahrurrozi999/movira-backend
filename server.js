@@ -21,7 +21,7 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: "15mb" }));
-
+const DEMO_MODE = true;
 const generateLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 10,
@@ -174,7 +174,17 @@ if (authError || !user) {
         error: "Durasi harus antara 2 dan 30 detik."
       });
     }
-
+if (DEMO_MODE) {
+  return res.json({
+    ok: true,
+    requestId: `demo-${Date.now()}`,
+    video: {
+      url: "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"
+    },
+    duration: videoDuration,
+    actualPrompt: prompt.trim()
+  });
+}
     let startImageUrl = imageUrl;
 
     // Mendukung gambar dalam bentuk data URI dari frontend.
