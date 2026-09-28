@@ -95,7 +95,10 @@ console.log("GET /api/credits", {
       .select("credits")
       .eq("user_id", user.id)
       .single();
-
+console.log("HASIL KREDIT:", {
+  credits: data?.credits,
+  hasError: Boolean(error)
+});
     if (error) {
       console.error("Gagal membaca kredit:", error);
 
