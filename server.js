@@ -21,7 +21,7 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: "15mb" }));
-const DEMO_MODE = true;
+const DEMO_MODE = process.env.DEMO_MODE === "true";
 const generateLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 10,
