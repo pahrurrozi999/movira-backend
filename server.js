@@ -63,6 +63,7 @@ app.get("/api/health", (_req, res) => {
   });
 });
 app.get("/api/credits", async (req, res) => {
+ console.log("KODE KREDIT TERBARU V1");
   try {
     const authHeader = req.headers.authorization || "";
 
