@@ -19,7 +19,13 @@ app.use(cors({
   origin: process.env.ALLOWED_ORIGIN || "http://localhost:3000",
   methods: ["GET", "POST"],
 }));
-
+app.use((req, res, next) => {
+  console.log("REQUEST MASUK:", req.method, req.path, {
+    origin: req.headers.origin,
+    hasAuth: Boolean(req.headers.authorization)
+  });
+  next();
+});
 app.use(express.json({ limit: "15mb" }));
 const DEMO_MODE = process.env.DEMO_MODE === "true";
 const generateLimiter = rateLimit({
