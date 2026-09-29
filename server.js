@@ -88,7 +88,9 @@ console.log("SELESAI GET USER", {
   hasUser: Boolean(user),
   hasAuthError: Boolean(authError)
 });
-
+   
+console.log("SUPABASE AUTH DETAIL:", JSON.stringify(authError));
+   
    console.error(
   "SUPABASE AUTH ERROR:",
   authError?.message || "user tidak ditemukan"
