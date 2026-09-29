@@ -300,14 +300,37 @@ if (!creditConsumed) {
       logs: true
     });
 
-    return res.json({
-      ok: true,
-      requestId: result.requestId,
-      video: result.data?.video || null,
-      seed: result.data?.seed ?? null,
-      duration: result.data?.duration ?? null,
-      actualPrompt: result.data?.actual_prompt ?? null
-    });
+    const videoUrl =
+  result.data?.video?.url ||
+  result.data?.video?.video_url ||
+  (typeof result.data?.video === "string"
+    ? result.data.video
+    : null);
+
+const { error: historyError } = await supabase
+  .from("video_history")
+  .insert({
+    user_id: user.id,
+    prompt: prompt.trim(),
+    video_url: videoUrl,
+    source_image_url: startImageUrl,
+    ratio,
+    duration: videoDuration,
+    resolution
+  });
+
+if (historyError) {
+  console.error("Gagal menyimpan riwayat video:", historyError);
+}
+
+return res.json({
+  ok: true,
+  requestId: result.requestId,
+  video: result.data?.video || null,
+  seed: result.data?.seed ?? null,
+  duration: result.data?.duration ?? null,
+  actualPrompt: result.data?.actual_prompt ?? null
+});
 
   } catch (error) {
     console.error("Movira generation error:", error);
