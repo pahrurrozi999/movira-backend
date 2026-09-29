@@ -84,7 +84,10 @@ console.log("GET /api/credits", {
       data: { user },
       error: authError
     } = await supabase.auth.getUser(accessToken);
-
+console.log("SELESAI GET USER", {
+  hasUser: Boolean(user),
+  hasAuthError: Boolean(authError)
+});
     if (authError || !user) {
       return res.status(401).json({
         error: "Sesi login tidak valid."
