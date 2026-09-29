@@ -211,11 +211,33 @@ const {
       });
     }
 if (DEMO_MODE) {
+  const demoVideoUrl =
+    "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
+
+  const { error: demoHistoryError } = await supabase
+    .from("video_history")
+    .insert({
+      user_id: user.id,
+      prompt: prompt.trim(),
+      video_url: demoVideoUrl,
+      source_image_url: null,
+      ratio,
+      duration: videoDuration,
+      resolution
+    });
+
+  if (demoHistoryError) {
+    console.error(
+      "Gagal menyimpan riwayat demo:",
+      demoHistoryError
+    );
+  }
+
   return res.json({
     ok: true,
     requestId: `demo-${Date.now()}`,
     video: {
-      url: "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"
+      url: demoVideoUrl
     },
     duration: videoDuration,
     actualPrompt: prompt.trim()
