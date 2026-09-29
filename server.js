@@ -88,6 +88,12 @@ console.log("SELESAI GET USER", {
   hasUser: Boolean(user),
   hasAuthError: Boolean(authError)
 });
+
+   console.error(
+  "SUPABASE AUTH ERROR:",
+  authError?.message || "user tidak ditemukan"
+);
+   
     if (authError || !user) {
       return res.status(401).json({
         error: "Sesi login tidak valid."
