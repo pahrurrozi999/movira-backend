@@ -486,8 +486,7 @@ app.post("/api/credit-orders", async (req, res) => {
 app.post("/api/payment-webhook", async (req, res) => {
   try {
     const webhookSecret =
-      req.headers["x-movira-webhook-secret"];
-
+  req.headers["x-callback-token"];
     if (
       !webhookSecret ||
       webhookSecret !== process.env.PAYMENT_WEBHOOK_SECRET
