@@ -11,6 +11,20 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SECRET_KEY
 );
+async function applyPaidCreditOrder(orderId) {
+  const { data, error } = await supabase.rpc(
+    "apply_credit_order_paid",
+    {
+      p_order_id: orderId
+    }
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return data;
+}
 const PORT = Number(process.env.PORT || 3000);
 
 app.use(helmet());
