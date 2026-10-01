@@ -483,11 +483,65 @@ app.post("/api/credit-orders", async (req, res) => {
   }
 });
 
+app.post("/api/payment-webhook", async (req, res) => {
+  try {
+    const webhookSecret =
+      req.headers["x-movira-webhook-secret"];
+
+    if (
+      !webhookSecret ||
+      webhookSecret !== process.env.PAYMENT_WEBHOOK_SECRET
+    ) {
+      return res.status(401).json({
+        error: "Webhook tidak sah."
+      });
+    }
+
+    const orderId = String(
+      req.body?.order_id || ""
+    ).trim();
+
+    const status = String(
+      req.body?.status || ""
+    ).toLowerCase();
+
+    if (!orderId) {
+      return res.status(400).json({
+        error: "order_id wajib diisi."
+      });
+    }
+
+    if (status !== "paid") {
+      return res.json({
+        ok: true,
+        ignored: true,
+        status
+      });
+    }
+
+    const order = await applyPaidCreditOrder(orderId);
+
+    return res.json({
+      ok: true,
+      order
+    });
+
+  } catch (error) {
+    console.error("Payment webhook error:", error);
+
+    return res.status(500).json({
+      error: "Gagal memproses pembayaran."
+    });
+  }
+});
+
 app.use((_req, res) => {
   res.status(404).json({
     error: "Endpoint tidak ditemukan."
   });
 });
+
+
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Movira backend berjalan di port ${PORT}`);
