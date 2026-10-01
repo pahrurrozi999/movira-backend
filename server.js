@@ -11,6 +11,7 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SECRET_KEY
 );
+
 async function applyPaidCreditOrder(orderId) {
   const { data, error } = await supabase.rpc(
     "apply_credit_order_paid",
