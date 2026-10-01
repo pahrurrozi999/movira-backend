@@ -372,6 +372,102 @@ if (creditWasConsumed && creditUserId) {
   }
 });
 
+app.post("/api/credit-orders", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+
+    const accessToken = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : null;
+
+    if (!accessToken) {
+      return res.status(401).json({
+        error: "Belum login."
+      });
+    }
+
+    const {
+      data: { user },
+      error: userError
+    } = await supabase.auth.getUser(accessToken);
+
+    if (userError || !user) {
+      return res.status(401).json({
+        error: "Sesi login tidak valid."
+      });
+    }
+
+    const credits = Number(req.body?.credits);
+    const currency = String(
+      req.body?.currency || "IDR"
+    ).toUpperCase();
+
+    const prices = {
+      IDR: {
+        50: 5000,
+        120: 10000,
+        300: 20000
+      },
+      MYR: {
+        50: 5,
+        120: 10,
+        300: 20
+      },
+      USD: {
+        50: 2,
+        120: 5,
+        300: 10
+      }
+    };
+
+    if (!prices[currency]) {
+      return res.status(400).json({
+        error: "Mata uang belum didukung."
+      });
+    }
+
+    if (![50, 120, 300].includes(credits)) {
+      return res.status(400).json({
+        error: "Paket kredit tidak valid."
+      });
+    }
+
+    const amount = prices[currency][credits];
+
+    const { data: order, error: orderError } = await supabase
+      .from("credit_orders")
+      .insert({
+        user_id: user.id,
+        credits,
+        amount,
+        currency,
+        status: "pending"
+      })
+      .select("id,credits,amount,currency,status,created_at")
+      .single();
+
+    if (orderError) {
+      console.error("Gagal membuat order kredit:", orderError);
+
+      return res.status(500).json({
+        error: "Gagal membuat pesanan kredit."
+      });
+    }
+
+    return res.json({
+      ok: true,
+      order
+    });
+
+  } catch (error) {
+    console.error("Credit order error:", error);
+
+    return res.status(500).json({
+      error: "Terjadi kesalahan saat membuat pesanan."
+    });
+  }
+});
+
 app.use((_req, res) => {
   res.status(404).json({
     error: "Endpoint tidak ditemukan."
