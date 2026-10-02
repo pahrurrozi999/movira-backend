@@ -241,7 +241,40 @@ const {
         error: "Durasi harus antara 2 dan 30 detik."
       });
     }
+ 
 if (DEMO_MODE) {
+  const freeTrial = await consumeFreeVideoTrial(user.id);
+
+  let demoCreditConsumed = false;
+
+  if (!freeTrial) {
+    const {
+      data: creditConsumed,
+      error: creditError
+    } = await supabase.rpc("consume_credit", {
+      p_user_id: user.id
+    });
+
+    if (creditError) {
+      console.error(
+        "Gagal memproses kredit demo:",
+        creditError
+      );
+
+      return res.status(500).json({
+        error: "Gagal memproses kredit."
+      });
+    }
+
+    if (!creditConsumed) {
+      return res.status(402).json({
+        error: "Kredit tidak cukup."
+      });
+    }
+
+    demoCreditConsumed = true;
+  }
+
   const demoVideoUrl =
     "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
 
@@ -271,9 +304,12 @@ if (DEMO_MODE) {
       url: demoVideoUrl
     },
     duration: videoDuration,
-    actualPrompt: prompt.trim()
+    actualPrompt: prompt.trim(),
+    freeTrial: freeTrial,
+    creditConsumed: demoCreditConsumed
   });
 }
+ 
     let startImageUrl = imageUrl;
 
     // Mendukung gambar dalam bentuk data URI dari frontend.
