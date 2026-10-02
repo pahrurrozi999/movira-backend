@@ -26,6 +26,22 @@ async function applyPaidCreditOrder(orderId) {
 
   return data;
 }
+
+async function consumeFreeVideoTrial(userId) {
+  const { data, error } = await supabase.rpc(
+    "consume_free_video_trial",
+    {
+      p_user_id: userId
+    }
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return data === true;
+}
+
 const PORT = Number(process.env.PORT || 3000);
 
 app.use(helmet());
