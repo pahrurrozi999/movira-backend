@@ -513,22 +513,28 @@ app.post("/api/credit-orders", async (req, res) => {
     ).toUpperCase();
 
     const prices = {
-      IDR: {
-        50: 5000,
-        120: 10000,
-        300: 20000
-      },
-      MYR: {
-        50: 5,
-        120: 10,
-        300: 20
-      },
-      USD: {
-        50: 2,
-        120: 5,
-        300: 10
-      }
-    };
+  IDR: {
+    50: 15000,
+    120: 35000,
+    300: 85000,
+    500: 135000,
+    1000: 250000
+  },
+  MYR: {
+    50: 5,
+    120: 10,
+    300: 20,
+    500: 35,
+    1000: 65
+  },
+  USD: {
+    50: 1,
+    120: 2,
+    300: 5,
+    500: 8,
+    1000: 14
+  }
+};
 
     if (!prices[currency]) {
       return res.status(400).json({
@@ -536,7 +542,7 @@ app.post("/api/credit-orders", async (req, res) => {
       });
     }
 
-    if (![50, 120, 300].includes(credits)) {
+    if (![50, 120, 300, 500, 1000].includes(credits)) {
       return res.status(400).json({
         error: "Paket kredit tidak valid."
       });
