@@ -387,7 +387,7 @@ if (!creditConsumed) {
   });
 }
    creditWasConsumed = true;
-    const result = await fal.subscribe(MODEL, {
+    const result = await fal.subscribe(model, {
       input: {
         prompt: prompt.trim(),
         start_image_url: startImageUrl,
