@@ -210,7 +210,7 @@ const {
   resolution = "720p",
   imageUrl,
   imageData,
-  audio = true
+  audio = true,
   model = DEFAULT_MODEL
 } = req.body || {};
   
