@@ -72,7 +72,13 @@ const generateLimiter = rateLimit({
   }
 });
 
-const MODEL = "alibaba/wan-3.0-prime/image-to-video";
+const DEFAULT_MODEL = "alibaba/wan-3.0-prime/image-to-video";
+
+const ALLOWED_MODELS = new Set([
+  "alibaba/wan-3.0-prime/image-to-video",
+  "alibaba/wan-3.0/image-to-video",
+  "wan/v2.6/image-to-video"
+]);
 
 const allowedRatios = new Set([
   "16:9",
