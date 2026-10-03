@@ -211,10 +211,10 @@ const {
   imageUrl,
   imageData,
   audio = true
+  model = DEFAULT_MODEL
 } = req.body || {};
   
-
-    if (
+   if (
       typeof prompt !== "string" ||
       prompt.trim().length < 3 ||
       prompt.length > 5000
