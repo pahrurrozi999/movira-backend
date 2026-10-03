@@ -248,6 +248,12 @@ const {
       });
     }
  
+if (!ALLOWED_MODELS.has(model)) {
+  return res.status(400).json({
+    error: "Model tidak valid."
+  });
+}
+ 
 if (DEMO_MODE) {
   const freeTrial = await consumeFreeVideoTrial(user.id);
 
