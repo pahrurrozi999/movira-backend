@@ -253,6 +253,34 @@ if (!ALLOWED_MODELS.has(model)) {
     error: "Model tidak valid."
   });
 }
+
+ const creditCosts = {
+  "alibaba/wan-3.0/image-to-video": {
+    "480p": { 5: 23, 10: 45, 15: 68 },
+    "720p": { 5: 45, 10: 90, 15: 135 },
+    "1080p": { 5: 90, 10: 179, 15: 269 }
+  },
+
+  "alibaba/wan-3.0-prime/image-to-video": {
+    "480p": { 5: 31, 10: 61, 15: 92 },
+    "720p": { 5: 63, 10: 126, 15: 188 },
+    "1080p": { 5: 126, 10: 251, 15: 376 }
+  },
+
+  "wan/v2.6/image-to-video": {
+    "720p": { 5: 45, 10: 90, 15: 135 },
+    "1080p": { 5: 68, 10: 135, 15: 202 }
+  }
+};
+
+const creditAmount =
+  creditCosts[model]?.[resolution]?.[videoDuration];
+
+if (!creditAmount) {
+  return res.status(400).json({
+    error: "Kombinasi model, resolusi, dan durasi tidak tersedia."
+  });
+}
  
 if (DEMO_MODE) {
   const freeTrial = await consumeFreeVideoTrial(user.id);
@@ -370,7 +398,8 @@ if (DEMO_MODE) {
     }
 const { data: creditConsumed, error: creditError } =
   await supabase.rpc("consume_credit", {
-    p_user_id: user.id
+    p_user_id: user.id,
+    p_amount: creditAmount
   });
 
 if (creditError) {
@@ -437,7 +466,9 @@ return res.json({
     console.error("Movira generation error:", error);
 if (creditWasConsumed && creditUserId) {
   const { error: refundError } = await supabase.rpc("refund_credit", {
-    p_user_id: creditUserId
+  p_user_id: creditUserId,
+  p_amount: creditAmount
+});
   });
 
   if (refundError) {
