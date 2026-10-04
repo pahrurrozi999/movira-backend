@@ -450,8 +450,7 @@ if (creditWasConsumed && creditUserId) {
   p_user_id: creditUserId,
   p_amount: creditAmount
 });
-  });
-
+  
   if (refundError) {
     console.error("Gagal mengembalikan kredit:", refundError);
   }
