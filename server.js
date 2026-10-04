@@ -282,38 +282,19 @@ if (!creditAmount) {
   });
 }
  
-if (DEMO_MODE) {
-  const freeTrial = await consumeFreeVideoTrial(user.id);
+let freeTrial = false;
+let demoCreditConsumed = false;
 
-  let demoCreditConsumed = false;
+if (DEMO_MODE) {
+  freeTrial = await consumeFreeVideoTrial(user.id);
 
   if (!freeTrial) {
-    const {
-      data: creditConsumed,
-      error: creditError
-    } = await supabase.rpc("consume_credit", {
-      p_user_id: user.id
+    return res.status(403).json({
+      error: "Free Trial sudah habis."
     });
-
-    if (creditError) {
-      console.error(
-        "Gagal memproses kredit demo:",
-        creditError
-      );
-
-      return res.status(500).json({
-        error: "Gagal memproses kredit."
-      });
-    }
-
-    if (!creditConsumed) {
-      return res.status(402).json({
-        error: "Kredit tidak cukup."
-      });
-    }
-
-    demoCreditConsumed = true;
   }
+
+  demoCreditConsumed = true;
 
   const demoVideoUrl =
     "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
@@ -345,7 +326,7 @@ if (DEMO_MODE) {
     },
     duration: videoDuration,
     actualPrompt: prompt.trim(),
-    freeTrial: freeTrial,
+    freeTrial,
     creditConsumed: demoCreditConsumed
   });
 }
