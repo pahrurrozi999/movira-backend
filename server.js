@@ -128,10 +128,9 @@ console.log("SELESAI GET USER", {
    
 console.log("SUPABASE AUTH DETAIL:", JSON.stringify(authError));
    
-   console.error(
-  "SUPABASE AUTH ERROR:",
-  authError?.message || "user tidak ditemukan"
-);
+   if (authError) {
+  console.error("SUPABASE AUTH ERROR:", authError.message);
+   }
    
     if (authError || !user) {
       return res.status(401).json({
