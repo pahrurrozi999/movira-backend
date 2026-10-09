@@ -448,7 +448,7 @@ const falInput = isVeoModel
       enable_prompt_expansion: true,
       enable_safety_checker: true
     };
-
+ 
 const result = await fal.subscribe(model, {
   input: falInput,
   logs: true
