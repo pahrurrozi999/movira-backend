@@ -429,8 +429,6 @@ if (!creditConsumed) {
 }
    creditWasConsumed = true;
     
-const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
-
 const falInput = isVeoModel
   ? {
       prompt: prompt.trim(),
