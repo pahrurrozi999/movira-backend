@@ -237,17 +237,43 @@ const {
       });
     }
 
-    const videoDuration = Number(duration);
+    
+const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
 
-    if (
-      !Number.isInteger(videoDuration) ||
-      videoDuration < 2 ||
-      videoDuration > 30
-    ) {
-      return res.status(400).json({
-        error: "Durasi harus antara 2 dan 30 detik."
-      });
-    }
+const videoDuration = isVeoModel
+  ? Number(String(duration).replace(/s$/, ""))
+  : Number(duration);
+
+if (
+  !Number.isInteger(videoDuration) ||
+  (isVeoModel && ![4, 6, 8].includes(videoDuration)) ||
+  (!isVeoModel && (videoDuration < 2 || videoDuration > 30))
+) {
+  return res.status(400).json({
+    error: isVeoModel
+      ? "Durasi Veo harus 4, 6, atau 8 detik."
+      : "Durasi harus antara 2 dan 30 detik."
+  });
+}
+ 
+ if (
+  isVeoModel &&
+  !["16:9", "9:16"].includes(ratio)
+) {
+  return res.status(400).json({
+    error: "Veo hanya mendukung rasio 16:9 atau 9:16."
+  });
+ }
+
+if (
+  isVeoModel &&
+  !["720p", "1080p"].includes(resolution)
+) {
+  return res.status(400).json({
+    error: "Veo hanya mendukung resolusi 720p atau 1080p."
+  });
+}
+ 
  
 if (!ALLOWED_MODELS.has(model)) {
   return res.status(400).json({
@@ -271,7 +297,11 @@ if (!ALLOWED_MODELS.has(model)) {
   "wan/v2.6/image-to-video": {
     "720p": { 5: 45, 10: 90, 15: 135 },
     "1080p": { 5: 68, 10: 135, 15: 202 }
-  }
+  },
+"fal-ai/veo3.1/lite/image-to-video": {
+  "720p": { 4: 20, 6: 30, 8: 40 },
+  "1080p": { 4: 32, 6: 48, 8: 64 }
+},
 };
 
 const creditAmount =
@@ -398,19 +428,34 @@ if (!creditConsumed) {
   });
 }
    creditWasConsumed = true;
-    const result = await fal.subscribe(model, {
-      input: {
-        prompt: prompt.trim(),
-        start_image_url: startImageUrl,
-        resolution,
-        aspect_ratio: ratio,
-        duration: videoDuration,
-        audio: Boolean(audio),
-        enable_prompt_expansion: true,
-        enable_safety_checker: true
-      },
-      logs: true
-    });
+    
+const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
+
+const falInput = isVeoModel
+  ? {
+      prompt: prompt.trim(),
+      image_url: startImageUrl,
+      resolution,
+      aspect_ratio: ratio,
+      duration: `${videoDuration}s`,
+      generate_audio: Boolean(audio)
+    }
+  : {
+      prompt: prompt.trim(),
+      start_image_url: startImageUrl,
+      resolution,
+      aspect_ratio: ratio,
+      duration: videoDuration,
+      audio: Boolean(audio),
+      enable_prompt_expansion: true,
+      enable_safety_checker: true
+    };
+
+const result = await fal.subscribe(model, {
+  input: falInput,
+  logs: true
+});
+ 
 
     const videoUrl =
   result.data?.video?.url ||
