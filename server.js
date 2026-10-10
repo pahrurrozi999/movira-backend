@@ -80,6 +80,7 @@ const ALLOWED_MODELS = new Set([
   "alibaba/wan-3.0/image-to-video",
   "wan/v2.6/image-to-video",
   "fal-ai/veo3.1/lite/image-to-video",
+  "wan/v2.6/reference-to-video/flash",
 ]);
 
 const allowedRatios = new Set([
@@ -239,6 +240,7 @@ const {
 
     
 const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
+const isReferenceModel = model === "wan/v2.6/reference-to-video/flash";
 
 const videoDuration = isVeoModel
   ? Number(String(duration).replace(/s$/, ""))
@@ -246,8 +248,9 @@ const videoDuration = isVeoModel
 
 if (
   !Number.isInteger(videoDuration) ||
-  (isVeoModel && ![4, 6, 8].includes(videoDuration)) ||
-  (!isVeoModel && (videoDuration < 2 || videoDuration > 30))
+(isVeoModel && ![4, 6, 8].includes(videoDuration)) ||
+(isReferenceModel && ![5, 10].includes(videoDuration)) ||
+(!isVeoModel && !isReferenceModel && (videoDuration < 2 || videoDuration > 30))
 ) {
   return res.status(400).json({
     error: isVeoModel
@@ -257,20 +260,21 @@ if (
 }
  
  if (
-  isVeoModel &&
+  (isVeoModel || isReferenceModel) &&
   !["16:9", "9:16"].includes(ratio)
+)
 ) {
   return res.status(400).json({
-    error: "Veo hanya mendukung rasio 16:9 atau 9:16."
+    error: "Model ini hanya mendukung rasio 16:9 atau 9:16."
   });
  }
 
 if (
-  isVeoModel &&
+  (isVeoModel || isReferenceModel) &&
   !["720p", "1080p"].includes(resolution)
 ) {
   return res.status(400).json({
-    error: "Veo hanya mendukung resolusi 720p atau 1080p."
+    error: "Model ini hanya mendukung resolusi 720p atau 1080p."
   });
 }
  
@@ -301,6 +305,10 @@ if (!ALLOWED_MODELS.has(model)) {
 "fal-ai/veo3.1/lite/image-to-video": {
   "720p": { 4: 20, 6: 30, 8: 40 },
   "1080p": { 4: 32, 6: 48, 8: 64 }
+},
+  "wan/v2.6/reference-to-video/flash": {
+  "720p": { 5: 50, 10: 100 },
+  "1080p": { 5: 75, 10: 150 }
 },
 };
 
