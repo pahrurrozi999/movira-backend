@@ -217,7 +217,8 @@ const {
   audio = true,
   model = DEFAULT_MODEL
 } = req.body || {};
-  
+  const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
+  const isReferenceModel = model === "wan/v2.6/reference-to-video/flash";
    if (
   typeof prompt !== "string" ||
   prompt.trim().length < 3 ||
@@ -229,9 +230,6 @@ const {
       : "Prompt tidak valid."
   });
    }
-
-const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
-const isReferenceModel = model === "wan/v2.6/reference-to-video/flash";
 
 const videoDuration = isVeoModel
   ? Number(String(duration).replace(/s$/, ""))
@@ -375,7 +373,7 @@ if (isReferenceModel) {
     referenceImages.length + referenceVideos.length > 5
   ) {
     return res.status(400).json({
-      error: "Maksimal 5 referensi: gabungan gambar dan video."
+      error: "Maksimal 5 referensi total, termasuk maksimal 3 video."
     });
   }
 
