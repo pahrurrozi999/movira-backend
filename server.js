@@ -255,7 +255,6 @@ if (
  if (
   (isVeoModel || isReferenceModel) &&
   !["16:9", "9:16"].includes(ratio)
-)
 ) {
   return res.status(400).json({
     error: "Model ini hanya mendukung rasio 16:9 atau 9:16."
