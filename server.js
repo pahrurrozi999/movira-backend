@@ -245,8 +245,10 @@ if (
 ) {
   return res.status(400).json({
     error: isVeoModel
-      ? "Durasi Veo harus 4, 6, atau 8 detik."
-      : "Durasi harus antara 2 dan 30 detik."
+  ? "Durasi Veo harus 4, 6, atau 8 detik."
+  : isReferenceModel
+  ? "Durasi Reference harus 5 atau 10 detik."
+  : "Durasi harus antara 2 dan 30 detik."
   });
 }
  
@@ -265,11 +267,7 @@ if (
   !["720p", "1080p"].includes(resolution)
 ) {
   return res.status(400).json({
-    error: isVeoModel
-  ? "Durasi Veo harus 4, 6, atau 8 detik."
-  : isReferenceModel
-  ? "Durasi Reference harus 5 atau 10 detik."
-  : "Durasi harus antara 2 dan 30 detik."
+    error: "Model ini hanya mendukung resolusi 720p atau 1080p."
   });
 }
  
@@ -559,7 +557,9 @@ const { error: historyError } = await supabase
     user_id: user.id,
     prompt: prompt.trim(),
     video_url: videoUrl,
-    source_image_url: startImageUrl,
+    source_image_url: isReferenceModel
+  ? (referenceImageUrls[0] || referenceVideoUrls[0] || null)
+  : startImageUrl,
     ratio,
     duration: videoDuration,
     resolution
