@@ -212,33 +212,24 @@ const {
   resolution = "720p",
   imageUrl,
   imageData,
+  referenceImages = [],
+  referenceVideos = [],
   audio = true,
   model = DEFAULT_MODEL
 } = req.body || {};
   
    if (
-      typeof prompt !== "string" ||
-      prompt.trim().length < 3 ||
-      prompt.length > 5000
-    ) {
-      return res.status(400).json({
-        error: "Prompt tidak valid."
-      });
-    }
+  typeof prompt !== "string" ||
+  prompt.trim().length < 3 ||
+  prompt.trim().length > (isReferenceModel ? 1500 : 5000)
+) {
+  return res.status(400).json({
+    error: isReferenceModel
+      ? "Prompt Reference maksimal 1500 karakter."
+      : "Prompt tidak valid."
+  });
+   }
 
-    if (!allowedRatios.has(ratio)) {
-      return res.status(400).json({
-        error: "Rasio tidak valid."
-      });
-    }
-
-    if (!allowedResolutions.has(resolution)) {
-      return res.status(400).json({
-        error: "Resolusi tidak valid."
-      });
-    }
-
-    
 const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
 const isReferenceModel = model === "wan/v2.6/reference-to-video/flash";
 
@@ -274,7 +265,11 @@ if (
   !["720p", "1080p"].includes(resolution)
 ) {
   return res.status(400).json({
-    error: "Model ini hanya mendukung resolusi 720p atau 1080p."
+    error: isVeoModel
+  ? "Durasi Veo harus 4, 6, atau 8 detik."
+  : isReferenceModel
+  ? "Durasi Reference harus 5 atau 10 detik."
+  : "Durasi harus antara 2 dan 30 detik."
   });
 }
  
@@ -370,52 +365,128 @@ if (DEMO_MODE) {
   });
 }
  
-    let startImageUrl = imageUrl;
+   let startImageUrl = imageUrl;
+let referenceImageUrls = [];
+let referenceVideoUrls = [];
 
-    // Mendukung gambar dalam bentuk data URI dari frontend.
-    if (!startImageUrl && typeof imageData === "string") {
-      if (!imageData.startsWith("data:image/")) {
-        return res.status(400).json({
-          error: "Format imageData tidak valid."
-        });
-      }
+if (isReferenceModel) {
+  if (
+    !Array.isArray(referenceImages) ||
+    !Array.isArray(referenceVideos) ||
+    referenceImages.length > 5 ||
+    referenceVideos.length > 3 ||
+    referenceImages.length + referenceVideos.length > 5
+  ) {
+    return res.status(400).json({
+      error: "Maksimal 5 referensi: gabungan gambar dan video."
+    });
+  }
 
-      const match = imageData.match(
-        /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/
-      );
+  if (referenceImages.length + referenceVideos.length === 0) {
+    return res.status(400).json({
+      error: "Unggah minimal satu gambar atau video referensi."
+    });
+  }
 
-      if (!match) {
-        return res.status(400).json({
-          error: "Data gambar tidak valid."
-        });
-      }
-
-      const mimeType = match[1];
-      const base64Data = match[2];
-      const buffer = Buffer.from(base64Data, "base64");
-
-      if (buffer.length > 10 * 1024 * 1024) {
-        return res.status(400).json({
-          error: "Ukuran gambar maksimal 10 MB."
-        });
-      }
-
-      const extension = mimeType.split("/")[1].replace("jpeg", "jpg");
-
-      const file = new File(
-        [buffer],
-        `movira-input.${extension}`,
-        { type: mimeType }
-      );
-
-      startImageUrl = await fal.storage.upload(file);
+  const uploadReference = async (dataUrl, allowedTypes) => {
+    if (typeof dataUrl !== "string") {
+      throw new Error("Data referensi tidak valid.");
     }
 
-    if (!startImageUrl || typeof startImageUrl !== "string") {
+    const match = dataUrl.match(
+      /^data:(image\/[a-zA-Z0-9.+-]+|video\/[a-zA-Z0-9.+-]+);base64,(.+)$/
+    );
+
+    if (!match || !allowedTypes.includes(match[1])) {
+      throw new Error("Format file referensi tidak didukung.");
+    }
+
+    const buffer = Buffer.from(match[2], "base64");
+    const isVideo = match[1].startsWith("video/");
+    const maxBytes = isVideo ? 100 * 1024 * 1024 : 10 * 1024 * 1024;
+
+    if (buffer.length === 0 || buffer.length > maxBytes) {
+      throw new Error(
+        isVideo
+          ? "Ukuran video referensi maksimal 100 MB."
+          : "Ukuran gambar referensi maksimal 10 MB."
+      );
+    }
+
+    const subtype = match[1].split("/")[1].replace("jpeg", "jpg");
+    const file = new File(
+      [buffer],
+      `movira-reference.${subtype}`,
+      { type: match[1] }
+    );
+
+    return await fal.storage.upload(file);
+  };
+
+  try {
+    referenceImageUrls = await Promise.all(
+      referenceImages.map(data =>
+        uploadReference(data, [
+          "image/jpeg",
+          "image/png",
+          "image/webp",
+          "image/bmp"
+        ])
+      )
+    );
+
+    referenceVideoUrls = await Promise.all(
+      referenceVideos.map(data =>
+        uploadReference(data, ["video/mp4", "video/quicktime"])
+      )
+    );
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+} else {
+  if (!startImageUrl && typeof imageData === "string") {
+    if (!imageData.startsWith("data:image/")) {
       return res.status(400).json({
-        error: "Gambar wajib diberikan."
+        error: "Format imageData tidak valid."
       });
     }
+
+    const match = imageData.match(
+      /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/
+    );
+
+    if (!match) {
+      return res.status(400).json({
+        error: "Data gambar tidak valid."
+      });
+    }
+
+    const mimeType = match[1];
+    const buffer = Buffer.from(match[2], "base64");
+
+    if (buffer.length === 0 || buffer.length > 10 * 1024 * 1024) {
+      return res.status(400).json({
+        error: "Ukuran gambar maksimal 10 MB."
+      });
+    }
+
+    const extension = mimeType.split("/")[1].replace("jpeg", "jpg");
+    const file = new File(
+      [buffer],
+      `movira-input.${extension}`,
+      { type: mimeType }
+    );
+
+    startImageUrl = await fal.storage.upload(file);
+  }
+
+  if (!startImageUrl || typeof startImageUrl !== "string") {
+    return res.status(400).json({
+      error: "Gambar wajib diberikan."
+    });
+  }
+     } 
+ 
 const { data: creditConsumed, error: creditError } =
   await supabase.rpc("consume_credit", {
     p_user_id: user.id,
@@ -437,7 +508,19 @@ if (!creditConsumed) {
 }
    creditWasConsumed = true;
     
-const falInput = isVeoModel
+const falInput = isReferenceModel
+  ? {
+      prompt: prompt.trim(),
+      image_urls: referenceImageUrls,
+      video_urls: referenceVideoUrls,
+      resolution,
+      aspect_ratio: ratio,
+      duration: String(videoDuration),
+      generate_audio: Boolean(audio),
+      enable_prompt_expansion: true,
+      enable_safety_checker: true
+    }
+  : isVeoModel
   ? {
       prompt: prompt.trim(),
       image_url: startImageUrl,
