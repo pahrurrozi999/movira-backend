@@ -255,15 +255,24 @@ if (
   });
 }
  
- if (
-  (isVeoModel || isReferenceModel || isVideoToVideoModel) &&
+if (
+  (isVeoModel || isReferenceModel) &&
   !["16:9", "9:16"].includes(ratio)
 ) {
   return res.status(400).json({
     error: "Model ini hanya mendukung rasio 16:9 atau 9:16."
   });
- }
+}
 
+if (
+  isVideoToVideoModel &&
+  !["16:9", "9:16", "1:1"].includes(ratio)
+) {
+  return res.status(400).json({
+    error: "Video to Video mendukung rasio 16:9, 9:16, atau 1:1."
+  });
+}
+ 
 if (
 (isVeoModel || isReferenceModel) &&
 !["720p", "1080p"].includes(resolution)
