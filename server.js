@@ -81,6 +81,7 @@ const ALLOWED_MODELS = new Set([
   "wan/v2.6/image-to-video",
   "fal-ai/veo3.1/lite/image-to-video",
   "wan/v2.6/reference-to-video/flash",
+  "fal-ai/wan/v2.2-a14b/video-to-video",
 ]);
 
 const allowedRatios = new Set([
@@ -214,11 +215,14 @@ const {
   imageData,
   referenceImages = [],
   referenceVideos = [],
+  sourceVideo = null,
   audio = true,
   model = DEFAULT_MODEL
 } = req.body || {};
   const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
   const isReferenceModel = model === "wan/v2.6/reference-to-video/flash";
+  const isVideoToVideoModel =
+  model === "fal-ai/wan/v2.2-a14b/video-to-video";
    if (
   typeof prompt !== "string" ||
   prompt.trim().length < 3 ||
@@ -239,7 +243,7 @@ if (
   !Number.isInteger(videoDuration) ||
 (isVeoModel && ![4, 6, 8].includes(videoDuration)) ||
 (isReferenceModel && ![5, 10].includes(videoDuration)) ||
-(!isVeoModel && !isReferenceModel && (videoDuration < 2 || videoDuration > 30))
+(!isVeoModel && !isReferenceModel && !isVideoToVideoModel && (videoDuration < 2 || videoDuration > 30))
 ) {
   return res.status(400).json({
     error: isVeoModel
@@ -251,7 +255,7 @@ if (
 }
  
  if (
-  (isVeoModel || isReferenceModel) &&
+  (isVeoModel || isReferenceModel || isVideoToVideoModel) &&
   !["16:9", "9:16"].includes(ratio)
 ) {
   return res.status(400).json({
@@ -260,14 +264,22 @@ if (
  }
 
 if (
-  (isVeoModel || isReferenceModel) &&
-  !["720p", "1080p"].includes(resolution)
+(isVeoModel || isReferenceModel) &&
+!["720p", "1080p"].includes(resolution)
 ) {
+
   return res.status(400).json({
     error: "Model ini hanya mendukung resolusi 720p atau 1080p."
   });
 }
- 
+if (
+  isVideoToVideoModel &&
+  !["480p", "580p", "720p"].includes(resolution)
+) {
+  return res.status(400).json({
+    error: "Video to Video mendukung resolusi 480p, 580p, atau 720p."
+  });
+} 
  
 if (!ALLOWED_MODELS.has(model)) {
   return res.status(400).json({
@@ -299,6 +311,11 @@ if (!ALLOWED_MODELS.has(model)) {
   "wan/v2.6/reference-to-video/flash": {
   "720p": { 5: 50, 10: 100 },
   "1080p": { 5: 75, 10: 150 }
+},
+  "fal-ai/wan/v2.2-a14b/video-to-video": {
+  "480p": { 5: 20, 10: 40 },
+  "580p": { 5: 25, 10: 50 },
+  "720p": { 5: 35, 10: 70 }
 },
 };
 
@@ -363,7 +380,8 @@ if (DEMO_MODE) {
    let startImageUrl = imageUrl;
 let referenceImageUrls = [];
 let referenceVideoUrls = [];
-
+let sourceVideoUrl = null;
+ 
 if (isReferenceModel) {
   if (
     !Array.isArray(referenceImages) ||
@@ -438,6 +456,48 @@ if (isReferenceModel) {
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
+} else if (isVideoToVideoModel) {
+  if (typeof sourceVideo !== "string") {
+    return res.status(400).json({
+      error: "Unggah video sumber terlebih dahulu."
+    });
+  }
+
+  const videoMatch = sourceVideo.match(
+    /^data:(video\/mp4);base64,(.+)$/
+  );
+
+  if (!videoMatch) {
+    return res.status(400).json({
+      error: "Format video harus MP4."
+    });
+  }
+
+  const videoBuffer = Buffer.from(videoMatch[2], "base64");
+
+  if (
+    videoBuffer.length === 0 ||
+    videoBuffer.length > 100 * 1024 * 1024
+  ) {
+    return res.status(400).json({
+      error: "Ukuran video maksimal 100 MB."
+    });
+  }
+
+  const videoFile = new File(
+    [videoBuffer],
+    "movira-source.mp4",
+    { type: "video/mp4" }
+  );
+
+  try {
+    sourceVideoUrl = await fal.storage.upload(videoFile);
+  } catch (error) {
+    return res.status(400).json({
+      error: "Gagal mengunggah video sumber."
+    });
+  }
+
 } else {
   if (!startImageUrl && typeof imageData === "string") {
     if (!imageData.startsWith("data:image/")) {
@@ -503,7 +563,16 @@ if (!creditConsumed) {
 }
    creditWasConsumed = true;
     
-const falInput = isReferenceModel
+const falInput = isVideoToVideoModel
+  ? {
+      video_url: sourceVideoUrl,
+      prompt: prompt.trim(),
+      resolution,
+      aspect_ratio: ratio,
+      num_inference_steps: 27,
+      enable_safety_checker: true
+    }
+  : isReferenceModel
   ? {
       prompt: prompt.trim(),
       image_urls: referenceImageUrls,
