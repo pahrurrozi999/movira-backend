@@ -5,6 +5,7 @@ import rateLimit from "express-rate-limit";
 import { fal } from "@fal-ai/client";
 import { createClient } from "@supabase/supabase-js";
 import "dotenv/config";
+Add multer import for video uploads
 const app = express();
 
 const supabase = createClient(
