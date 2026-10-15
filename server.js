@@ -341,7 +341,11 @@ if (!creditAmount) {
 let freeTrial = false;
 let demoCreditConsumed = false;
 
-if (DEMO_MODE) {
+if (
+  DEMO_MODE &&
+  !isReferenceModel &&
+  !isVideoToVideoModel
+) {
   freeTrial = await consumeFreeVideoTrial(user.id);
 
   if (!freeTrial) {
