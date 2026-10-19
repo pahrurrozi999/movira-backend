@@ -630,7 +630,11 @@ const result = await fal.subscribe(model, {
   (typeof result.data?.video === "string"
     ? result.data.video
     : null);
-
+ 
+if (!videoUrl) {
+  throw new Error("Layanan video tidak mengembalikan URL video.");
+}
+ 
 const { error: historyError } = await supabase
   .from("video_history")
   .insert({
