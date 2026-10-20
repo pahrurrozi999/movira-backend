@@ -176,7 +176,7 @@ console.log("HASIL KREDIT:", {
 app.post("/api/generate", generateLimiter, async (req, res) => {
   let creditWasConsumed = false;
 let creditUserId = null;
-
+let creditRequestId = null;
 try {
    const authHeader = req.headers.authorization || "";
 
@@ -555,14 +555,17 @@ if (isReferenceModel) {
       error: "Gambar wajib diberikan."
     });
   }
-     } 
- 
-const { data: creditConsumed, error: creditError } =
-  await supabase.rpc("consume_credit", {
-    p_user_id: user.id,
-    p_amount: creditAmount
-  });
+     }  
 
+creditRequestId = randomUUID();
+
+const { data: creditConsumed, error: creditError } =
+  await supabase.rpc("consume_credit_for_request", {
+    p_user_id: user.id,
+    p_amount: creditAmount,
+    p_request_id: creditRequestId
+  });
+   
 if (creditError) {
   console.error("Gagal memproses kredit:", creditError);
 
@@ -665,12 +668,15 @@ return res.json({
 
   } catch (error) {
     console.error("Movira generation error:", error);
-if (creditWasConsumed && creditUserId) {
-  const { error: refundError } = await supabase.rpc("refund_credit", {
-  p_user_id: creditUserId,
-  p_amount: creditAmount
-});
-  
+
+if (creditWasConsumed && creditUserId && creditRequestId) {
+  const { error: refundError } =
+    await supabase.rpc("refund_credit_for_request", {
+      p_user_id: creditUserId,
+      p_amount: creditAmount,
+      p_request_id: creditRequestId
+    });
+   
   if (refundError) {
     console.error("Gagal mengembalikan kredit:", refundError);
   }
