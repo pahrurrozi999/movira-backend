@@ -4,6 +4,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { fal } from "@fal-ai/client";
 import { createClient } from "@supabase/supabase-js";
+import { randomUUID } from "node:crypto";
 import "dotenv/config";
 import multer from "multer";
 const app = express();
