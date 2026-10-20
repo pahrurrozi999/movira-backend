@@ -697,13 +697,20 @@ return res.json({
       resultError
     );
   }
-} else {
-  console.error("Fal.ai masih memproses permintaan:", {
-    requestId: falRequestId,
-    status: falStatus.status
-  });
-          }
- 
+          } else {
+            console.error("Fal.ai masih memproses permintaan:", {
+              requestId: falRequestId,
+              status: falStatus.status
+            });
+          
+        } catch (statusError) {
+          console.error(
+            "Gagal memeriksa status fal.ai:",
+            statusError
+          );
+        }
+      }
+    }
     return res.status(500).json({
       error: "Gagal membuat video.",
       message: "Terjadi kesalahan saat menghubungi layanan video."
