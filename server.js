@@ -702,7 +702,7 @@ return res.json({
               requestId: falRequestId,
               status: falStatus.status
             });
-          
+          }
         } catch (statusError) {
           console.error(
             "Gagal memeriksa status fal.ai:",
