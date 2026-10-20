@@ -684,7 +684,7 @@ const result = await fal.subscribe(model, {
       }
     });
  } 
- 
+ });
     const videoUrl =
   result.data?.video?.url ||
   result.data?.video?.video_url ||
