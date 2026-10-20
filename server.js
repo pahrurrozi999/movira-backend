@@ -174,9 +174,10 @@ console.log("HASIL KREDIT:", {
   }
 });
 app.post("/api/generate", generateLimiter, async (req, res) => {
-  let creditWasConsumed = false;
+let creditWasConsumed = false;
 let creditUserId = null;
 let creditRequestId = null;
+let falRequestId = null;
 try {
    const authHeader = req.headers.authorization || "";
 
@@ -624,10 +625,13 @@ const falInput = isVideoToVideoModel
  
 const result = await fal.subscribe(model, {
   input: falInput,
-  logs: true
+  logs: true,
+  onEnqueue: (requestId) => {
+    falRequestId = requestId;
+    console.log("Fal request ID:", falRequestId);
+  }
 });
  
-
     const videoUrl =
   result.data?.video?.url ||
   result.data?.video?.video_url ||
@@ -669,18 +673,37 @@ return res.json({
   } catch (error) {
     console.error("Movira generation error:", error);
 
-if (creditWasConsumed && creditUserId && creditRequestId) {
-  const { error: refundError } =
-    await supabase.rpc("refund_credit_for_request", {
-      p_user_id: creditUserId,
-      p_amount: creditAmount,
-      p_request_id: creditRequestId
+    if (creditWasConsumed && creditUserId && creditRequestId) {
+      if (falRequestId) {
+        try {
+          const falStatus = await fal.queue.status(model, {
+            requestId: falRequestId,
+            logs: true
+          });
+
+          if (falStatus.status === "COMPLETED") {
+  try {
+    const falResult = await fal.queue.result(model, {
+      requestId: falRequestId
     });
-   
-  if (refundError) {
-    console.error("Gagal mengembalikan kredit:", refundError);
+
+    console.error("Hasil fal.ai tersedia:", {
+      requestId: falRequestId,
+      hasData: Boolean(falResult.data)
+    });
+  } catch (resultError) {
+    console.error(
+      "Hasil fal.ai belum dapat diambil; refund tetap ditunda:",
+      resultError
+    );
   }
-}
+} else {
+  console.error("Fal.ai masih memproses permintaan:", {
+    requestId: falRequestId,
+    status: falStatus.status
+  });
+          }
+ 
     return res.status(500).json({
       error: "Gagal membuat video.",
       message: "Terjadi kesalahan saat menghubungi layanan video."
