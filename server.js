@@ -560,28 +560,66 @@ if (isReferenceModel) {
 
 creditRequestId = randomUUID();
 
+const { error: requestInsertError } = await supabase
+  .from("video_generation_requests")
+  .insert({
+    user_id: user.id,
+    credit_request_id: creditRequestId,
+    model,
+    status: "submitted",
+    credit_amount: creditAmount
+  });
+
+if (requestInsertError) {
+  console.error(
+    "Gagal mencatat permintaan video:",
+    requestInsertError
+  );
+
+  return res.status(500).json({
+    error: "Gagal mencatat permintaan video."
+  });
+}
+
 const { data: creditConsumed, error: creditError } =
   await supabase.rpc("consume_credit_for_request", {
     p_user_id: user.id,
     p_amount: creditAmount,
     p_request_id: creditRequestId
   });
-   
+
 if (creditError) {
   console.error("Gagal memproses kredit:", creditError);
 
+  await supabase
+    .from("video_generation_requests")
+    .update({
+      status: "unknown",
+      error_message: "Status pemotongan kredit belum dapat dipastikan."
+    })
+    .eq("credit_request_id", creditRequestId);
+
   return res.status(500).json({
-    error: "Gagal memproses kredit."
+    error: "Status pemotongan kredit belum dapat dipastikan."
   });
 }
 
-if (!creditConsumed) { 
+if (!creditConsumed) {
+  await supabase
+    .from("video_generation_requests")
+    .update({
+      status: "failed_confirmed",
+      error_message: "Kredit tidak cukup."
+    })
+    .eq("credit_request_id", creditRequestId);
+
   return res.status(402).json({
     error: "Kredit tidak cukup."
   });
 }
-   creditWasConsumed = true;
-    
+
+creditWasConsumed = true;
+ 
 const falInput = isVideoToVideoModel
   ? {
       video_url: sourceVideoUrl,
@@ -626,11 +664,26 @@ const falInput = isVideoToVideoModel
 const result = await fal.subscribe(model, {
   input: falInput,
   logs: true,
-  onEnqueue: (requestId) => {
-    falRequestId = requestId;
-    console.log("Fal request ID:", falRequestId);
-  }
-});
+ onEnqueue: (requestId) => {
+  falRequestId = requestId;
+  console.log("Fal request ID:", falRequestId);
+
+  void supabase
+    .from("video_generation_requests")
+    .update({
+      fal_request_id: requestId,
+      status: "processing"
+    })
+    .eq("credit_request_id", creditRequestId)
+    .then(({ error }) => {
+      if (error) {
+        console.error(
+          "Gagal memperbarui status permintaan video:",
+          error
+        );
+      }
+    });
+ } 
  
     const videoUrl =
   result.data?.video?.url ||
@@ -660,7 +713,20 @@ const { error: historyError } = await supabase
 if (historyError) {
   console.error("Gagal menyimpan riwayat video:", historyError);
 }
+const { error: requestUpdateError } = await supabase
+  .from("video_generation_requests")
+  .update({
+    status: "succeeded",
+    error_message: null
+  })
+  .eq("credit_request_id", creditRequestId);
 
+if (requestUpdateError) {
+  console.error(
+    "Gagal memperbarui status permintaan video:",
+    requestUpdateError
+  );
+}
 return res.json({
   ok: true,
   requestId: result.requestId,
@@ -672,7 +738,25 @@ return res.json({
 
   } catch (error) {
     console.error("Movira generation error:", error);
+ 
+if (creditRequestId) {
+  const { error: statusUpdateError } = await supabase
+    .from("video_generation_requests")
+    .update({
+      status: "unknown",
+      error_message: String(
+        error?.message || "Status hasil video belum dapat dipastikan."
+      )
+    })
+    .eq("credit_request_id", creditRequestId);
 
+  if (statusUpdateError) {
+    console.error(
+      "Gagal mencatat status error permintaan video:",
+      statusUpdateError
+    );
+  }
+}
     if (creditWasConsumed && creditUserId && creditRequestId) {
       if (falRequestId) {
         try {
