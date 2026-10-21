@@ -675,6 +675,7 @@ const result = await fal.subscribe(model, {
       status: "processing"
     })
     .eq("credit_request_id", creditRequestId)
+.in("status", ["submitted", "processing"])
     .then(({ error }) => {
       if (error) {
         console.error(
