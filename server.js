@@ -105,6 +105,60 @@ app.get("/api/health", (_req, res) => {
     version: "0.2.0"
   });
 });
+
+app.get("/api/video-requests", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const accessToken = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : null;
+
+    if (!accessToken) {
+      return res.status(401).json({
+        error: "Silakan login terlebih dahulu."
+      });
+    }
+
+    const {
+      data: { user },
+      error: authError
+    } = await supabase.auth.getUser(accessToken);
+
+    if (authError || !user) {
+      return res.status(401).json({
+        error: "Sesi login tidak valid."
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("video_generation_requests")
+      .select(
+        "id, model, status, credit_amount, created_at, updated_at"
+      )
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(20);
+
+    if (error) {
+      console.error("Gagal membaca antrean video:", error);
+      return res.status(500).json({
+        error: "Gagal membaca status video."
+      });
+    }
+
+    return res.json({
+      ok: true,
+      requests: data || []
+    });
+  } catch (error) {
+    console.error("Video requests error:", error);
+
+    return res.status(500).json({
+      error: "Terjadi kesalahan saat membaca antrean video."
+    });
+  }
+});
+
 app.get("/api/credits", async (req, res) => {
  console.log("KODE KREDIT TERBARU V1");
   try {
