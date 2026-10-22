@@ -232,6 +232,7 @@ let creditWasConsumed = false;
 let creditUserId = null;
 let creditRequestId = null;
 let falRequestId = null;
+let falModel = null;
 try {
    const authHeader = req.headers.authorization || "";
 
@@ -352,6 +353,8 @@ if (!ALLOWED_MODELS.has(model)) {
     error: "Model tidak valid."
   });
 }
+
+falModel = model;
 
  const creditCosts = {
   "alibaba/wan-3.0/image-to-video": {
@@ -815,14 +818,14 @@ if (creditRequestId) {
     if (creditWasConsumed && creditUserId && creditRequestId) {
       if (falRequestId) {
         try {
-          const falStatus = await fal.queue.status(model, {
+          const falStatus = await fal.queue.status(falModel, {
             requestId: falRequestId,
             logs: true
           });
 
           if (falStatus.status === "COMPLETED") {
   try {
-    const falResult = await fal.queue.result(model, {
+    const falResult = await fal.queue.result(falModel, {
       requestId: falRequestId
     });
 
