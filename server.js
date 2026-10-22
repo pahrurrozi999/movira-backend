@@ -159,6 +159,58 @@ app.get("/api/video-requests", async (req, res) => {
   }
 });
 
+app.get("/api/video-history", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const accessToken = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : null;
+
+    if (!accessToken) {
+      return res.status(401).json({
+        error: "Silakan login terlebih dahulu."
+      });
+    }
+
+    const {
+      data: { user },
+      error: authError
+    } = await supabase.auth.getUser(accessToken);
+
+    if (authError || !user) {
+      return res.status(401).json({
+        error: "Sesi login tidak valid."
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("video_history")
+      .select(
+        "id, prompt, video_url, source_image_url, ratio, duration, resolution, created_at"
+      )
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (error) {
+      console.error("Gagal membaca riwayat video:", error);
+      return res.status(500).json({
+        error: "Gagal membaca riwayat video."
+      });
+    }
+
+    return res.json({
+      ok: true,
+      history: data || []
+    });
+  } catch (error) {
+    console.error("Video history error:", error);
+    return res.status(500).json({
+      error: "Terjadi kesalahan saat membaca riwayat video."
+    });
+  }
+});
+
 app.get("/api/credits", async (req, res) => {
  console.log("KODE KREDIT TERBARU V1");
   try {
