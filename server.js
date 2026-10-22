@@ -233,6 +233,7 @@ let creditUserId = null;
 let creditRequestId = null;
 let falRequestId = null;
 let falModel = null;
+let recoveryData = null;
 try {
    const authHeader = req.headers.authorization || "";
 
@@ -718,6 +719,18 @@ const falInput = isVideoToVideoModel
       enable_safety_checker: true
     };
  
+ recoveryData = {
+  userId: user.id,
+  creditRequestId,
+  prompt: prompt.trim(),
+  sourceImageUrl: isReferenceModel
+    ? (referenceImageUrls[0] || referenceVideoUrls[0] || null)
+    : startImageUrl,
+  ratio,
+  duration: videoDuration,
+  resolution
+};
+ 
 const result = await fal.subscribe(model, {
   input: falInput,
   logs: true,
@@ -822,23 +835,79 @@ if (creditRequestId) {
             requestId: falRequestId,
             logs: true
           });
-
-          if (falStatus.status === "COMPLETED") {
+          
+if (falStatus.status === "COMPLETED") {
   try {
     const falResult = await fal.queue.result(falModel, {
       requestId: falRequestId
     });
 
-    console.error("Hasil fal.ai tersedia:", {
-      requestId: falRequestId,
-      hasData: Boolean(falResult.data)
-    });
+    const recoveredVideoUrl =
+      falResult.data?.video?.url ||
+      falResult.data?.video?.video_url ||
+      (typeof falResult.data?.video === "string"
+        ? falResult.data.video
+        : null);
+
+    if (!recoveredVideoUrl || !recoveryData) {
+      console.error(
+        "Hasil fal.ai belum memiliki URL video yang bisa dipulihkan.",
+        { requestId: falRequestId }
+      );
+    } else {
+      const { data: existingHistory, error: historyCheckError } =
+        await supabase
+          .from("video_history")
+          .select("id")
+          .eq("user_id", recoveryData.userId)
+          .eq("video_url", recoveredVideoUrl)
+          .limit(1);
+
+      if (historyCheckError) {
+        throw historyCheckError;
+      }
+
+      if (!existingHistory || existingHistory.length === 0) {
+        const { error: recoveryHistoryError } = await supabase
+          .from("video_history")
+          .insert({
+            user_id: recoveryData.userId,
+            prompt: recoveryData.prompt,
+            video_url: recoveredVideoUrl,
+            source_image_url: recoveryData.sourceImageUrl,
+            ratio: recoveryData.ratio,
+            duration: recoveryData.duration,
+            resolution: recoveryData.resolution
+          });
+
+        if (recoveryHistoryError) {
+          throw recoveryHistoryError;
+        }
+      }
+
+      const { error: recoveryStatusError } = await supabase
+        .from("video_generation_requests")
+        .update({
+          status: "succeeded",
+          error_message: null
+        })
+        .eq("credit_request_id", creditRequestId);
+
+      if (recoveryStatusError) {
+        throw recoveryStatusError;
+      }
+
+      console.log("Hasil fal.ai berhasil dipulihkan.", {
+        requestId: falRequestId
+      });
+    }
   } catch (resultError) {
     console.error(
-      "Hasil fal.ai belum dapat diambil; refund tetap ditunda:",
+      "Pemulihan hasil fal.ai gagal; kredit tidak dikembalikan.",
       resultError
     );
-  }
+         }
+ 
           } else {
             console.error("Fal.ai masih memproses permintaan:", {
               requestId: falRequestId,
