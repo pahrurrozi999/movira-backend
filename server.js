@@ -715,14 +715,14 @@ creditRequestId = randomUUID();
 const { error: requestInsertError } = await supabase
   .from("video_generation_requests")
   .insert({
-    user_id: user.id,
-    credit_request_id: creditRequestId,
-    model,
-    status: "submitted",
-    credit_amount: creditAmount
-   project_id: projectIdForDb,
-   scene_number: sceneNumberForDb
-  });
+  user_id: user.id,
+  credit_request_id: creditRequestId,
+  model,
+  status: "submitted",
+  credit_amount: creditAmount,
+  project_id: projectIdForDb,
+  scene_number: sceneNumberForDb
+});
 
 if (requestInsertError) {
   console.error(
