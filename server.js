@@ -824,7 +824,10 @@ const falInput = isVideoToVideoModel
     : startImageUrl,
   ratio,
   duration: videoDuration,
-  resolution
+  resolution,
+  projectId: projectIdForDb,
+  sceneNumber: sceneNumberForDb
+};
 };
  
 const result = await fal.subscribe(model, {
@@ -969,15 +972,16 @@ if (falStatus.status === "COMPLETED") {
         const { error: recoveryHistoryError } = await supabase
           .from("video_history")
           .insert({
-            user_id: recoveryData.userId,
-            prompt: recoveryData.prompt,
-            video_url: recoveredVideoUrl,
-            source_image_url: recoveryData.sourceImageUrl,
-            ratio: recoveryData.ratio,
-            duration: recoveryData.duration,
-            resolution: recoveryData.resolution
-          });
-
+  user_id: recoveryData.userId,
+  prompt: recoveryData.prompt,
+  video_url: recoveredVideoUrl,
+  source_image_url: recoveryData.sourceImageUrl,
+  ratio: recoveryData.ratio,
+  duration: recoveryData.duration,
+  resolution: recoveryData.resolution,
+  project_id: recoveryData.projectId,
+  scene_number: recoveryData.sceneNumber
+});
         if (recoveryHistoryError) {
           throw recoveryHistoryError;
         }
