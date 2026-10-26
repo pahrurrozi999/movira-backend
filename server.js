@@ -328,23 +328,65 @@ const {
   referenceVideos = [],
   sourceVideo = null,
   audio = true,
-  model = DEFAULT_MODEL
+  model = DEFAULT_MODEL,
+  project_id: projectId = null,
+  scene_number: sceneNumber = null
 } = req.body || {};
-  const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
-  const isReferenceModel = model === "wan/v2.6/reference-to-video/flash";
-  const isVideoToVideoModel =
-  model === "fal-ai/wan/v2.2-a14b/video-to-video";
-   if (
-  typeof prompt !== "string" ||
-  prompt.trim().length < 3 ||
-  prompt.trim().length > (isReferenceModel ? 1500 : 5000)
-) {
-  return res.status(400).json({
-    error: isReferenceModel
-      ? "Prompt Reference maksimal 1500 karakter."
-      : "Prompt tidak valid."
-  });
-   }
+
+let projectIdForDb = null;
+let sceneNumberForDb = null;
+
+if (projectId !== null && projectId !== "") {
+  if (
+    typeof projectId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(projectId)
+  ) {
+    return res.status(400).json({
+      error: "ID proyek tidak valid."
+    });
+  }
+
+  const parsedSceneNumber = Number(sceneNumber);
+
+  if (
+    !Number.isInteger(parsedSceneNumber) ||
+    parsedSceneNumber < 1
+  ) {
+    return res.status(400).json({
+      error: "Nomor scene tidak valid."
+    });
+  }
+
+  const {
+    data: linkedProject,
+    error: linkedProjectError
+  } = await supabase
+    .from("projects")
+    .select("id")
+    .eq("id", projectId)
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  if (linkedProjectError) {
+    console.error(
+      "Gagal memverifikasi proyek:",
+      linkedProjectError
+    );
+
+    return res.status(500).json({
+      error: "Gagal memverifikasi proyek."
+    });
+  }
+
+  if (!linkedProject) {
+    return res.status(404).json({
+      error: "Proyek tidak ditemukan pada akun ini."
+    });
+  }
+
+  projectIdForDb = projectId;
+  sceneNumberForDb = parsedSceneNumber;
+}
 
 const videoDuration = isVeoModel
   ? Number(String(duration).replace(/s$/, ""))
@@ -678,6 +720,8 @@ const { error: requestInsertError } = await supabase
     model,
     status: "submitted",
     credit_amount: creditAmount
+   project_id: projectIdForDb,
+   scene_number: sceneNumberForDb
   });
 
 if (requestInsertError) {
@@ -821,17 +865,19 @@ if (!videoUrl) {
  
 const { error: historyError } = await supabase
   .from("video_history")
-  .insert({
-    user_id: user.id,
-    prompt: prompt.trim(),
-    video_url: videoUrl,
-    source_image_url: isReferenceModel
-  ? (referenceImageUrls[0] || referenceVideoUrls[0] || null)
-  : startImageUrl,
-    ratio,
-    duration: videoDuration,
-    resolution
-  });
+    .insert({
+      user_id: user.id,
+      prompt: prompt.trim(),
+      video_url: videoUrl,
+      source_image_url: isReferenceModel
+        ? (referenceImageUrls[0] || referenceVideoUrls[0] || null)
+        : startImageUrl,
+      ratio,
+      duration: videoDuration,
+      resolution,
+      project_id: projectIdForDb,
+      scene_number: sceneNumberForDb
+    });
 
 if (historyError) {
   console.error("Gagal menyimpan riwayat video:", historyError);
