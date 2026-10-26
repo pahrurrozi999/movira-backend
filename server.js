@@ -133,7 +133,7 @@ app.get("/api/video-requests", async (req, res) => {
     const { data, error } = await supabase
       .from("video_generation_requests")
       .select(
-        "id, model, status, credit_amount, created_at, updated_at"
+        "id, model, status, credit_amount, project_id, scene_number, created_at, updated_at"
       )
       .eq("user_id", user.id)
       .order("created_at", { ascending: false })
@@ -186,7 +186,7 @@ app.get("/api/video-history", async (req, res) => {
     const { data, error } = await supabase
       .from("video_history")
       .select(
-        "id, prompt, video_url, source_image_url, ratio, duration, resolution, created_at"
+        "id, prompt, video_url, source_image_url, ratio, duration, resolution, project_id, scene_number, created_at"
       )
       .eq("user_id", user.id)
       .order("created_at", { ascending: false })
