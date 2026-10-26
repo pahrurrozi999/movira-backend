@@ -828,7 +828,6 @@ const falInput = isVideoToVideoModel
   projectId: projectIdForDb,
   sceneNumber: sceneNumberForDb
 };
-};
  
 const result = await fal.subscribe(model, {
   input: falInput,
