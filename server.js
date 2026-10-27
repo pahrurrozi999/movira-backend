@@ -522,7 +522,9 @@ if (
       source_image_url: null,
       ratio,
       duration: videoDuration,
-      resolution
+      resolution,
+     project_id: projectIdForDb,
+     scene_number: sceneNumberForDb
     });
 
   if (demoHistoryError) {
