@@ -332,7 +332,14 @@ const {
   project_id: projectId = null,
   scene_number: sceneNumber = null
 } = req.body || {};
+const isVeoModel =
+  model === "fal-ai/veo3.1/lite/image-to-video";
 
+const isReferenceModel =
+  model === "wan/v2.6/reference-to-video/flash";
+
+const isVideoToVideoModel =
+  model === "fal-ai/wan/v2.2-a14b/video-to-video";
 let projectIdForDb = null;
 let sceneNumberForDb = null;
 
