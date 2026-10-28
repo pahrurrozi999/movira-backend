@@ -91,6 +91,57 @@ function readMp4DurationSeconds(buffer) {
   }
 }
 
+function readImageDimensions(buffer, mimeType = "") {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 24) return null;
+
+  if (mimeType === "image/png" && buffer.toString("ascii", 1, 4) === "PNG") {
+    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+
+  if (mimeType === "image/bmp" && buffer.toString("ascii", 0, 2) === "BM" && buffer.length >= 26) {
+    return { width: Math.abs(buffer.readInt32LE(18)), height: Math.abs(buffer.readInt32LE(22)) };
+  }
+
+  if (mimeType === "image/jpeg" && buffer[0] === 0xff && buffer[1] === 0xd8) {
+    let offset = 2;
+    const sofMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+    while (offset + 4 < buffer.length) {
+      if (buffer[offset] !== 0xff) { offset += 1; continue; }
+      while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
+      if (offset >= buffer.length) break;
+      const marker = buffer[offset++];
+      if (marker === 0xd8 || marker === 0xd9 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+      if (offset + 2 > buffer.length) break;
+      const segmentLength = buffer.readUInt16BE(offset);
+      if (segmentLength < 2 || offset + segmentLength > buffer.length) break;
+      if (sofMarkers.has(marker) && segmentLength >= 7) {
+        const height = buffer.readUInt16BE(offset + 3);
+        const width = buffer.readUInt16BE(offset + 5);
+        return width > 0 && height > 0 ? { width, height } : null;
+      }
+      offset += segmentLength;
+    }
+  }
+
+  if (buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") {
+    const chunk = buffer.toString("ascii", 12, 16);
+    if (chunk === "VP8X" && buffer.length >= 30) {
+      return { width: 1 + buffer.readUIntLE(24, 3), height: 1 + buffer.readUIntLE(27, 3) };
+    }
+    if (chunk === "VP8L" && buffer.length >= 25 && buffer[20] === 0x2f) {
+      const b1 = buffer[21], b2 = buffer[22], b3 = buffer[23], b4 = buffer[24];
+      return {
+        width: 1 + (((b2 & 0x3f) << 8) | b1),
+        height: 1 + (((b4 & 0x0f) << 10) | (b3 << 2) | ((b2 & 0xc0) >> 6))
+      };
+    }
+    if (chunk === "VP8 " && buffer.length >= 30 && buffer[23] === 0x9d && buffer[24] === 0x01 && buffer[25] === 0x2a) {
+      return { width: buffer.readUInt16LE(26) & 0x3fff, height: buffer.readUInt16LE(28) & 0x3fff };
+    }
+  }
+  return null;
+}
+
 const PORT = Number(process.env.PORT || 3000);
 
 app.use(helmet());
@@ -132,6 +183,8 @@ const ALLOWED_MODELS = new Set([
   "wan/v2.6/reference-to-video/flash",
   "fal-ai/wan/v2.2-a14b/video-to-video",
   "minimax/h3-max-turbo/image-to-video",
+  "minimax/h3-max/reference-to-video",
+  "minimax/h3-max/reframe-video",
   "google/gemini-omni-flash/image-to-video",
   "google/gemini-omni-flash/v1.1/reference-to-video",
   "google/gemini-omni-flash/v1.1/edit",
@@ -388,13 +441,15 @@ const {
 } = req.body || {};
 const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
 const isH3Model = model === "minimax/h3-max-turbo/image-to-video";
+const isMiniMaxReferenceModel = model === "minimax/h3-max/reference-to-video";
+const isMiniMaxReframeModel = model === "minimax/h3-max/reframe-video";
 const isGeminiImageModel = model === "google/gemini-omni-flash/image-to-video";
 const isWanReferenceModel = model === "wan/v2.6/reference-to-video/flash";
 const isGeminiReferenceModel = model === "google/gemini-omni-flash/v1.1/reference-to-video";
-const isReferenceModel = isWanReferenceModel || isGeminiReferenceModel;
+const isReferenceModel = isWanReferenceModel || isGeminiReferenceModel || isMiniMaxReferenceModel;
 const isWanVideoToVideoModel = model === "fal-ai/wan/v2.2-a14b/video-to-video";
 const isGeminiEditModel = model === "google/gemini-omni-flash/v1.1/edit";
-const isVideoToVideoModel = isWanVideoToVideoModel || isGeminiEditModel;
+const isVideoToVideoModel = isWanVideoToVideoModel || isGeminiEditModel || isMiniMaxReframeModel;
 let projectIdForDb = null;
 let sceneNumberForDb = null;
 
@@ -454,14 +509,17 @@ const videoDuration = isVeoModel
   ? Number(String(duration).replace(/s$/, ""))
   : Number(duration);
 
-const invalidDuration = !Number.isInteger(videoDuration) ||
+const invalidDuration = !isMiniMaxReframeModel && (
+  !Number.isInteger(videoDuration) ||
   (isVeoModel && ![4, 6, 8].includes(videoDuration)) ||
   (isH3Model && ![5, 10, 15].includes(videoDuration)) ||
   (isGeminiImageModel && ![5, 10].includes(videoDuration)) ||
-  (isReferenceModel && ![5, 10].includes(videoDuration)) ||
+  (isMiniMaxReferenceModel && ![5, 10, 15].includes(videoDuration)) ||
+  (isReferenceModel && !isMiniMaxReferenceModel && ![5, 10].includes(videoDuration)) ||
   (isGeminiEditModel && ![5, 10].includes(videoDuration)) ||
   (isWanVideoToVideoModel && ![5, 10].includes(videoDuration)) ||
-  (!isVeoModel && !isH3Model && !isGeminiImageModel && !isReferenceModel && !isVideoToVideoModel && (videoDuration < 2 || videoDuration > 30));
+  (!isVeoModel && !isH3Model && !isGeminiImageModel && !isReferenceModel && !isVideoToVideoModel && (videoDuration < 2 || videoDuration > 30))
+);
 
 if (invalidDuration) {
   return res.status(400).json({
@@ -469,14 +527,16 @@ if (invalidDuration) {
       ? "Durasi Veo harus 4, 6, atau 8 detik."
       : isH3Model
       ? "Durasi MiniMax H3 Max Turbo harus 5, 10, atau 15 detik."
-      : (isGeminiImageModel || isReferenceModel || isVideoToVideoModel)
+      : isMiniMaxReferenceModel
+      ? "Durasi MiniMax H3 Max Reference to Video harus 5, 10, atau 15 detik."
+      : (isGeminiImageModel || (isReferenceModel && !isMiniMaxReferenceModel) || isVideoToVideoModel)
       ? "Durasi model ini harus 5 atau 10 detik."
       : "Durasi harus antara 2 dan 30 detik."
   });
 }
 
 if (
-  (isVeoModel || isGeminiImageModel || isReferenceModel) &&
+  (isVeoModel || isGeminiImageModel || (isReferenceModel && !isMiniMaxReferenceModel)) &&
   !["16:9", "9:16"].includes(ratio)
 ) {
   return res.status(400).json({
@@ -517,9 +577,15 @@ if (isGeminiImageModel && resolution !== "720p") {
   });
 }
 
-if (isH3Model && !["480p", "768p", "1080p"].includes(resolution)) {
+if ((isH3Model || isMiniMaxReferenceModel) && !["480p", "768p", "1080p"].includes(resolution)) {
   return res.status(400).json({
-    error: "MiniMax H3 Max Turbo mendukung resolusi 480p, 768p, atau 1080p."
+    error: "MiniMax H3 Max Turbo/Reference mendukung resolusi 480p, 768p, atau 1080p."
+  });
+}
+
+if (isMiniMaxReframeModel && !["480p", "768p", "1080p"].includes(resolution)) {
+  return res.status(400).json({
+    error: "MiniMax H3 Max Reframe hanya mendukung resolusi 480p atau 768p."
   });
 }
 
@@ -575,6 +641,11 @@ falModel = model;
     "768p": { 5: 19, 10: 34, 15: 50 },
     "1080p": { 5: 37, 10: 68, 15: 100 }
   },
+  "minimax/h3-max/reference-to-video": {
+    "480p": { 5: 25, 10: 50, 15: 75 },
+    "768p": { 5: 40, 10: 80, 15: 120 },
+    "1080p": { 5: 80, 10: 160, 15: 240 }
+  },
   "google/gemini-omni-flash/image-to-video": {
     "720p": { 5: 60, 10: 120 }
   },
@@ -590,10 +661,11 @@ falModel = model;
   }
 };
 
-const creditAmount =
-  creditCosts[model]?.[resolution]?.[videoDuration];
+let creditAmount = isMiniMaxReframeModel
+  ? null
+  : creditCosts[model]?.[resolution]?.[videoDuration];
 
-if (!creditAmount) {
+if (!creditAmount && !isMiniMaxReframeModel) {
   return res.status(400).json({
     error: "Kombinasi model, resolusi, dan durasi tidak tersedia."
   });
@@ -658,6 +730,7 @@ if (
 let referenceImageUrls = [];
 let referenceVideoUrls = [];
 let sourceVideoUrl = null;
+let actualVideoDuration = videoDuration;
  
 if (isReferenceModel) {
   if (
@@ -676,6 +749,63 @@ if (isReferenceModel) {
     return res.status(400).json({
       error: "Unggah minimal satu gambar atau video referensi."
     });
+  }
+
+  if (isMiniMaxReferenceModel) {
+    let referenceTokens = 0;
+    let totalReferenceVideoSeconds = 0;
+
+    for (const dataUrl of referenceImages) {
+      if (typeof dataUrl !== "string") {
+        return res.status(400).json({ error: "Data gambar referensi MiniMax tidak valid." });
+      }
+      const match = dataUrl.match(/^data:(image\/(?:jpeg|png|webp|bmp));base64,(.+)$/i);
+      if (!match) {
+        return res.status(400).json({ error: "Format gambar referensi MiniMax tidak didukung." });
+      }
+      const imageBuffer = Buffer.from(match[2], "base64");
+      if (imageBuffer.length === 0 || imageBuffer.length > 10 * 1024 * 1024) {
+        return res.status(400).json({ error: "Ukuran setiap gambar referensi maksimal 10 MB." });
+      }
+      const dimensions = readImageDimensions(imageBuffer, match[1].toLowerCase());
+      if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) {
+        return res.status(400).json({
+          error: "Ukuran gambar referensi MiniMax tidak dapat dibaca. Ekspor ulang sebagai JPG, PNG, atau WEBP lalu coba lagi."
+        });
+      }
+      referenceTokens += Math.ceil((dimensions.width * dimensions.height) / 1024);
+    }
+
+    for (const dataUrl of referenceVideos) {
+      if (typeof dataUrl !== "string") {
+        return res.status(400).json({ error: "Data video referensi MiniMax tidak valid." });
+      }
+      const match = dataUrl.match(/^data:video\/(?:mp4|quicktime);base64,(.+)$/i);
+      if (!match) {
+        return res.status(400).json({ error: "Format video referensi MiniMax tidak didukung." });
+      }
+      const videoBuffer = Buffer.from(match[1], "base64");
+      if (videoBuffer.length === 0 || videoBuffer.length > 100 * 1024 * 1024) {
+        return res.status(400).json({ error: "Ukuran setiap video referensi maksimal 100 MB." });
+      }
+      const seconds = readMp4DurationSeconds(videoBuffer);
+      if (!Number.isFinite(seconds) || seconds < 2 || seconds > 15) {
+        return res.status(400).json({ error: "Setiap video referensi MiniMax harus berdurasi 2–15 detik dan dapat dibaca." });
+      }
+      totalReferenceVideoSeconds += seconds;
+      const tokensPerSecond = resolution === "480p" ? 2886 : 7459;
+      referenceTokens += Math.ceil(seconds * tokensPerSecond);
+    }
+
+    if (totalReferenceVideoSeconds > 15) {
+      return res.status(400).json({ error: "Total durasi video referensi MiniMax maksimal 15 detik." });
+    }
+
+    const extraTokens = Math.max(0, referenceTokens - 4096);
+    // fal.ai bills $0.02 per 1,000 reference tokens after a 4,096-token allowance.
+    // Movira's existing MiniMax price uses a 2x output-cost factor; apply it to this surcharge too.
+    const referenceInputCredits = Math.ceil((extraTokens / 1000) * 2);
+    creditAmount += referenceInputCredits;
   }
 
   const uploadReference = async (dataUrl, allowedTypes) => {
@@ -761,8 +891,10 @@ if (isReferenceModel) {
     });
   }
 
+  const sourceDurationSeconds = (isGeminiEditModel || isMiniMaxReframeModel)
+    ? readMp4DurationSeconds(videoBuffer)
+    : null;
   if (isGeminiEditModel) {
-    const sourceDurationSeconds = readMp4DurationSeconds(videoBuffer);
     if (!Number.isFinite(sourceDurationSeconds) || sourceDurationSeconds <= 0) {
       return res.status(400).json({
         error: "Durasi video MP4 tidak dapat dibaca. Coba ekspor ulang video sebagai MP4 standar."
@@ -771,6 +903,26 @@ if (isReferenceModel) {
     if (sourceDurationSeconds > videoDuration + 0.01) {
       return res.status(400).json({
         error: `Video sumber berdurasi ${sourceDurationSeconds.toFixed(1)} detik, lebih lama dari paket ${videoDuration} detik. Pilih durasi yang mencukupi. Maksimum 10 detik.`
+      });
+    }
+  }
+  if (isMiniMaxReframeModel) {
+    if (!Number.isFinite(sourceDurationSeconds) || sourceDurationSeconds <= 0) {
+      return res.status(400).json({
+        error: "Durasi video MP4 tidak dapat dibaca. Coba ekspor ulang video sebagai MP4 standar."
+      });
+    }
+    if (sourceDurationSeconds > 15) {
+      return res.status(400).json({
+        error: "MiniMax H3 Max Reframe dibatasi pada video sumber maksimal 15 detik untuk menghindari biaya pemrosesan tambahan yang tidak terduga."
+      });
+    }
+    actualVideoDuration = Math.ceil(sourceDurationSeconds);
+    const creditsPerSecond = { "480p": 5, "768p": 8, "1080p": 16 }[resolution];
+    creditAmount = actualVideoDuration * creditsPerSecond;
+    if (!Number.isInteger(creditAmount) || creditAmount < 1) {
+      return res.status(400).json({
+        error: "Kombinasi resolusi dan durasi sumber tidak tersedia."
       });
     }
   }
@@ -897,7 +1049,15 @@ if (!creditConsumed) {
 
 creditWasConsumed = true;
  
-const falInput = isGeminiEditModel
+const falInput = isMiniMaxReframeModel
+  ? {
+      prompt: prompt.trim(),
+      video_url: sourceVideoUrl,
+      aspect_ratio: ratio,
+      resolution,
+      enable_safety_checker: true
+    }
+  : isGeminiEditModel
   ? {
       prompt: prompt.trim(),
       video_url: sourceVideoUrl,
@@ -910,6 +1070,17 @@ const falInput = isGeminiEditModel
       resolution,
       aspect_ratio: ratio,
       num_inference_steps: 27,
+      enable_safety_checker: true
+    }
+  : isMiniMaxReferenceModel
+  ? {
+      prompt: prompt.trim(),
+      reference_image_urls: referenceImageUrls,
+      reference_video_urls: referenceVideoUrls,
+      resolution: resolution.toUpperCase(),
+      aspect_ratio: ratio,
+      duration: videoDuration,
+      prompt_expansion_mode: "balanced",
       enable_safety_checker: true
     }
   : isGeminiReferenceModel
@@ -976,7 +1147,7 @@ const falInput = isGeminiEditModel
     ? (referenceImageUrls[0] || referenceVideoUrls[0] || null)
     : startImageUrl,
   ratio,
-  duration: videoDuration,
+  duration: actualVideoDuration,
   resolution,
   projectId: projectIdForDb,
   sceneNumber: sceneNumberForDb
@@ -1028,7 +1199,7 @@ const { error: historyError } = await supabase
         ? (referenceImageUrls[0] || referenceVideoUrls[0] || null)
         : startImageUrl,
       ratio,
-      duration: videoDuration,
+      duration: actualVideoDuration,
       resolution,
       project_id: projectIdForDb,
       scene_number: sceneNumberForDb
@@ -1056,7 +1227,7 @@ return res.json({
   requestId: result.requestId,
   video: result.data?.video || null,
   seed: result.data?.seed ?? null,
-  duration: result.data?.duration ?? null,
+  duration: result.data?.duration ?? actualVideoDuration,
   actualPrompt: result.data?.actual_prompt ?? null
 });
 
