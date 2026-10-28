@@ -44,6 +44,53 @@ async function consumeFreeVideoTrial(userId) {
   return data === true;
 }
 
+
+function findMp4Box(buffer, start, end, targetType) {
+  let offset = start;
+  while (offset + 8 <= end) {
+    let boxSize = buffer.readUInt32BE(offset);
+    const type = buffer.toString("ascii", offset + 4, offset + 8);
+    let headerSize = 8;
+    if (boxSize === 1) {
+      if (offset + 16 > end) return null;
+      const largeSize = buffer.readBigUInt64BE(offset + 8);
+      if (largeSize > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      boxSize = Number(largeSize);
+      headerSize = 16;
+    } else if (boxSize === 0) {
+      boxSize = end - offset;
+    }
+    if (boxSize < headerSize || offset + boxSize > end) return null;
+    if (type === targetType) {
+      return { start: offset + headerSize, end: offset + boxSize };
+    }
+    offset += boxSize;
+  }
+  return null;
+}
+
+function readMp4DurationSeconds(buffer) {
+  const moov = findMp4Box(buffer, 0, buffer.length, "moov");
+  if (!moov) return null;
+  const mvhd = findMp4Box(buffer, moov.start, moov.end, "mvhd");
+  if (!mvhd || mvhd.start >= mvhd.end) return null;
+  const version = buffer[mvhd.start];
+  try {
+    if (version === 1) {
+      if (mvhd.start + 32 > mvhd.end) return null;
+      const timescale = buffer.readUInt32BE(mvhd.start + 20);
+      const duration = Number(buffer.readBigUInt64BE(mvhd.start + 24));
+      return timescale > 0 && Number.isFinite(duration) ? duration / timescale : null;
+    }
+    if (mvhd.start + 20 > mvhd.end) return null;
+    const timescale = buffer.readUInt32BE(mvhd.start + 12);
+    const duration = buffer.readUInt32BE(mvhd.start + 16);
+    return timescale > 0 ? duration / timescale : null;
+  } catch {
+    return null;
+  }
+}
+
 const PORT = Number(process.env.PORT || 3000);
 
 app.use(helmet());
@@ -84,6 +131,10 @@ const ALLOWED_MODELS = new Set([
   "fal-ai/veo3.1/lite/image-to-video",
   "wan/v2.6/reference-to-video/flash",
   "fal-ai/wan/v2.2-a14b/video-to-video",
+  "minimax/h3-max-turbo/image-to-video",
+  "google/gemini-omni-flash/image-to-video",
+  "google/gemini-omni-flash/v1.1/reference-to-video",
+  "google/gemini-omni-flash/v1.1/edit",
 ]);
 
 const allowedRatios = new Set([
@@ -93,8 +144,11 @@ const allowedRatios = new Set([
 ]);
 
 const allowedResolutions = new Set([
+  "360p",
   "480p",
+  "580p",
   "720p",
+  "768p",
   "1080p"
 ]);
 
@@ -332,14 +386,15 @@ const {
   project_id: projectId = null,
   scene_number: sceneNumber = null
 } = req.body || {};
-const isVeoModel =
-  model === "fal-ai/veo3.1/lite/image-to-video";
-
-const isReferenceModel =
-  model === "wan/v2.6/reference-to-video/flash";
-
-const isVideoToVideoModel =
-  model === "fal-ai/wan/v2.2-a14b/video-to-video";
+const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
+const isH3Model = model === "minimax/h3-max-turbo/image-to-video";
+const isGeminiImageModel = model === "google/gemini-omni-flash/image-to-video";
+const isWanReferenceModel = model === "wan/v2.6/reference-to-video/flash";
+const isGeminiReferenceModel = model === "google/gemini-omni-flash/v1.1/reference-to-video";
+const isReferenceModel = isWanReferenceModel || isGeminiReferenceModel;
+const isWanVideoToVideoModel = model === "fal-ai/wan/v2.2-a14b/video-to-video";
+const isGeminiEditModel = model === "google/gemini-omni-flash/v1.1/edit";
+const isVideoToVideoModel = isWanVideoToVideoModel || isGeminiEditModel;
 let projectIdForDb = null;
 let sceneNumberForDb = null;
 
@@ -399,23 +454,29 @@ const videoDuration = isVeoModel
   ? Number(String(duration).replace(/s$/, ""))
   : Number(duration);
 
-if (
-  !Number.isInteger(videoDuration) ||
-(isVeoModel && ![4, 6, 8].includes(videoDuration)) ||
-(isReferenceModel && ![5, 10].includes(videoDuration)) ||
-(!isVeoModel && !isReferenceModel && !isVideoToVideoModel && (videoDuration < 2 || videoDuration > 30))
-) {
+const invalidDuration = !Number.isInteger(videoDuration) ||
+  (isVeoModel && ![4, 6, 8].includes(videoDuration)) ||
+  (isH3Model && ![5, 10, 15].includes(videoDuration)) ||
+  (isGeminiImageModel && ![5, 10].includes(videoDuration)) ||
+  (isReferenceModel && ![5, 10].includes(videoDuration)) ||
+  (isGeminiEditModel && ![5, 10].includes(videoDuration)) ||
+  (isWanVideoToVideoModel && ![5, 10].includes(videoDuration)) ||
+  (!isVeoModel && !isH3Model && !isGeminiImageModel && !isReferenceModel && !isVideoToVideoModel && (videoDuration < 2 || videoDuration > 30));
+
+if (invalidDuration) {
   return res.status(400).json({
     error: isVeoModel
-  ? "Durasi Veo harus 4, 6, atau 8 detik."
-  : isReferenceModel
-  ? "Durasi Reference harus 5 atau 10 detik."
-  : "Durasi harus antara 2 dan 30 detik."
+      ? "Durasi Veo harus 4, 6, atau 8 detik."
+      : isH3Model
+      ? "Durasi MiniMax H3 Max Turbo harus 5, 10, atau 15 detik."
+      : (isGeminiImageModel || isReferenceModel || isVideoToVideoModel)
+      ? "Durasi model ini harus 5 atau 10 detik."
+      : "Durasi harus antara 2 dan 30 detik."
   });
 }
- 
+
 if (
-  (isVeoModel || isReferenceModel) &&
+  (isVeoModel || isGeminiImageModel || isReferenceModel) &&
   !["16:9", "9:16"].includes(ratio)
 ) {
   return res.status(400).json({
@@ -433,23 +494,44 @@ if (
 }
  
 if (
-(isVeoModel || isReferenceModel) &&
-!["720p", "1080p"].includes(resolution)
+  (isVeoModel || isWanReferenceModel) &&
+  !["720p", "1080p"].includes(resolution)
 ) {
-
   return res.status(400).json({
     error: "Model ini hanya mendukung resolusi 720p atau 1080p."
   });
 }
+
 if (
-  isVideoToVideoModel &&
+  (isGeminiReferenceModel || isGeminiEditModel) &&
+  !["360p", "720p", "1080p"].includes(resolution)
+) {
+  return res.status(400).json({
+    error: "Gemini Omni Flash 1.1 mendukung resolusi 360p, 720p, atau 1080p."
+  });
+}
+
+if (isGeminiImageModel && resolution !== "720p") {
+  return res.status(400).json({
+    error: "Gemini Omni Flash Image to Video saat ini memakai resolusi 720p."
+  });
+}
+
+if (isH3Model && !["480p", "768p", "1080p"].includes(resolution)) {
+  return res.status(400).json({
+    error: "MiniMax H3 Max Turbo mendukung resolusi 480p, 768p, atau 1080p."
+  });
+}
+
+if (
+  isWanVideoToVideoModel &&
   !["480p", "580p", "720p"].includes(resolution)
 ) {
   return res.status(400).json({
-    error: "Video to Video mendukung resolusi 480p, 580p, atau 720p."
+    error: "Wan Video to Video mendukung resolusi 480p, 580p, atau 720p."
   });
-} 
- 
+}
+
 if (!ALLOWED_MODELS.has(model)) {
   return res.status(400).json({
     error: "Model tidak valid."
@@ -488,6 +570,24 @@ falModel = model;
   "580p": { 5: 25, 10: 50 },
   "720p": { 5: 35, 10: 70 }
 },
+  "minimax/h3-max-turbo/image-to-video": {
+    "480p": { 5: 12, 10: 22, 15: 32 },
+    "768p": { 5: 19, 10: 34, 15: 50 },
+    "1080p": { 5: 37, 10: 68, 15: 100 }
+  },
+  "google/gemini-omni-flash/image-to-video": {
+    "720p": { 5: 60, 10: 120 }
+  },
+  "google/gemini-omni-flash/v1.1/reference-to-video": {
+    "360p": { 5: 13, 10: 26 },
+    "720p": { 5: 42, 10: 84 },
+    "1080p": { 5: 63, 10: 125 }
+  },
+  "google/gemini-omni-flash/v1.1/edit": {
+    "360p": { 5: 13, 10: 26 },
+    "720p": { 5: 42, 10: 84 },
+    "1080p": { 5: 63, 10: 125 }
+  }
 };
 
 const creditAmount =
@@ -661,6 +761,20 @@ if (isReferenceModel) {
     });
   }
 
+  if (isGeminiEditModel) {
+    const sourceDurationSeconds = readMp4DurationSeconds(videoBuffer);
+    if (!Number.isFinite(sourceDurationSeconds) || sourceDurationSeconds <= 0) {
+      return res.status(400).json({
+        error: "Durasi video MP4 tidak dapat dibaca. Coba ekspor ulang video sebagai MP4 standar."
+      });
+    }
+    if (sourceDurationSeconds > videoDuration + 0.01) {
+      return res.status(400).json({
+        error: `Video sumber berdurasi ${sourceDurationSeconds.toFixed(1)} detik, lebih lama dari paket ${videoDuration} detik. Pilih durasi yang mencukupi. Maksimum 10 detik.`
+      });
+    }
+  }
+
   const videoFile = new File(
     [videoBuffer],
     "movira-source.mp4",
@@ -783,7 +897,13 @@ if (!creditConsumed) {
 
 creditWasConsumed = true;
  
-const falInput = isVideoToVideoModel
+const falInput = isGeminiEditModel
+  ? {
+      prompt: prompt.trim(),
+      video_url: sourceVideoUrl,
+      resolution
+    }
+  : isWanVideoToVideoModel
   ? {
       video_url: sourceVideoUrl,
       prompt: prompt.trim(),
@@ -792,7 +912,16 @@ const falInput = isVideoToVideoModel
       num_inference_steps: 27,
       enable_safety_checker: true
     }
-  : isReferenceModel
+  : isGeminiReferenceModel
+  ? {
+      prompt: prompt.trim(),
+      image_urls: referenceImageUrls,
+      reference_video_urls: referenceVideoUrls,
+      resolution,
+      aspect_ratio: ratio,
+      duration: videoDuration
+    }
+  : isWanReferenceModel
   ? {
       prompt: prompt.trim(),
       image_urls: referenceImageUrls,
@@ -803,6 +932,22 @@ const falInput = isVideoToVideoModel
       generate_audio: Boolean(audio),
       enable_prompt_expansion: true,
       enable_safety_checker: true
+    }
+  : isH3Model
+  ? {
+      prompt: prompt.trim(),
+      image_url: startImageUrl,
+      duration: videoDuration,
+      resolution: resolution.toUpperCase(),
+      prompt_expansion_mode: "balanced",
+      enable_safety_checker: true
+    }
+  : isGeminiImageModel
+  ? {
+      prompt: prompt.trim(),
+      image_url: startImageUrl,
+      aspect_ratio: ratio,
+      duration: videoDuration
     }
   : isVeoModel
   ? {
@@ -823,7 +968,6 @@ const falInput = isVideoToVideoModel
       enable_prompt_expansion: true,
       enable_safety_checker: true
     };
- 
  recoveryData = {
   userId: user.id,
   creditRequestId,
