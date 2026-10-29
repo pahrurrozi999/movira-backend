@@ -14,21 +14,6 @@ const supabase = createClient(
   process.env.SUPABASE_SECRET_KEY
 );
 
-async function applyPaidCreditOrder(orderId) {
-  const { data, error } = await supabase.rpc(
-    "apply_credit_order_paid",
-    {
-      p_order_id: orderId
-    }
-  );
-
-  if (error) {
-    throw error;
-  }
-
-  return data;
-}
-
 async function consumeFreeVideoTrial(userId) {
   const { data, error } = await supabase.rpc(
     "consume_free_video_trial",
@@ -162,6 +147,12 @@ app.use(cors({
 
 app.use(express.json({ limit: "15mb" }));
 const DEMO_MODE = process.env.DEMO_MODE === "true";
+const PAYMENT_SIMULATION_ENABLED = process.env.PAYMENT_SIMULATION_MODE === "true";
+const CREDIT_ORDER_PRICES = {
+  IDR: { 50: 15000, 120: 35000, 300: 85000, 500: 135000, 1000: 250000 },
+  MYR: { 50: 5, 120: 10, 300: 20, 500: 35, 1000: 65 },
+  USD: { 50: 1, 120: 2, 300: 5, 500: 8, 1000: 14 }
+};
 const generateLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 10,
@@ -1354,157 +1345,157 @@ if (falStatus.status === "COMPLETED") {
   }
 });
 
-app.post("/api/credit-orders", async (req, res) => {
+app.post("/api/credit-orders", (_req, res) => {
+  // Real-order creation is disabled while no verified payment provider is connected.
+  // Keep GET /api/credit-orders available for read-only history of existing orders.
+  return res.status(503).json({
+    error: "Pembuatan pesanan pembayaran nyata belum tersedia. Gunakan mode simulasi untuk pengujian."
+  });
+});
+
+
+// ===== Credit order history (real order records; no payment provider is connected yet) =====
+app.get("/api/credit-orders", async (req, res) => {
   try {
     const authHeader = req.headers.authorization || "";
-
-    const accessToken = authHeader.startsWith("Bearer ")
-      ? authHeader.slice(7)
-      : null;
-
-    if (!accessToken) {
-      return res.status(401).json({
-        error: "Belum login."
-      });
-    }
-
-    const {
-      data: { user },
-      error: userError
-    } = await supabase.auth.getUser(accessToken);
-
-    if (userError || !user) {
-      return res.status(401).json({
-        error: "Sesi login tidak valid."
-      });
-    }
-
-    const credits = Number(req.body?.credits);
-    const currency = String(
-      req.body?.currency || "IDR"
-    ).toUpperCase();
-
-    const prices = {
-  IDR: {
-    50: 15000,
-    120: 35000,
-    300: 85000,
-    500: 135000,
-    1000: 250000
-  },
-  MYR: {
-    50: 5,
-    120: 10,
-    300: 20,
-    500: 35,
-    1000: 65
-  },
-  USD: {
-    50: 1,
-    120: 2,
-    300: 5,
-    500: 8,
-    1000: 14
-  }
-};
-
-    if (!prices[currency]) {
-      return res.status(400).json({
-        error: "Mata uang belum didukung."
-      });
-    }
-
-    if (![50, 120, 300, 500, 1000].includes(credits)) {
-      return res.status(400).json({
-        error: "Paket kredit tidak valid."
-      });
-    }
-
-    const amount = prices[currency][credits];
-
-    const { data: order, error: orderError } = await supabase
+    const accessToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!accessToken) return res.status(401).json({ error: "Belum login." });
+    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) return res.status(401).json({ error: "Sesi login tidak valid." });
+    const { data, error } = await supabase
       .from("credit_orders")
-      .insert({
-        user_id: user.id,
-        credits,
-        amount,
-        currency,
-        status: "pending"
-      })
-      .select("id,credits,amount,currency,status,created_at")
-      .single();
-
-    if (orderError) {
-      console.error("Gagal membuat order kredit:", orderError);
-
-      return res.status(500).json({
-        error: "Gagal membuat pesanan kredit."
-      });
-    }
-
-    return res.json({
-      ok: true,
-      order
-    });
-
+      .select("id,credits,amount,currency,status,payment_method,provider,provider_order_id,created_at,paid_at")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(30);
+    if (error) throw error;
+    return res.json({ ok: true, orders: data || [] });
   } catch (error) {
-    console.error("Credit order error:", error);
-
-    return res.status(500).json({
-      error: "Terjadi kesalahan saat membuat pesanan."
-    });
+    console.error("Credit order history error:", error);
+    return res.status(500).json({ error: "Gagal membaca riwayat pesanan kredit." });
   }
 });
 
-app.post("/api/payment-webhook", async (req, res) => {
+// ===== Isolated payment simulation. It NEVER calls apply_credit_order_paid and NEVER changes balance. =====
+app.get("/api/credit-order-simulations", async (req, res) => {
+  if (!PAYMENT_SIMULATION_ENABLED) return res.status(503).json({ error: "Mode simulasi pembayaran belum diaktifkan pada backend." });
   try {
-    const webhookSecret =
-  req.headers["x-callback-token"];
-    if (
-      !webhookSecret ||
-      webhookSecret !== process.env.PAYMENT_WEBHOOK_SECRET
-    ) {
-      return res.status(401).json({
-        error: "Webhook tidak sah."
-      });
-    }
-
-    const orderId = String(
-      req.body?.order_id || ""
-    ).trim();
-
-    const status = String(
-      req.body?.status || ""
-    ).toLowerCase();
-
-    if (!orderId) {
-      return res.status(400).json({
-        error: "order_id wajib diisi."
-      });
-    }
-
-    if (status !== "paid") {
-      return res.json({
-        ok: true,
-        ignored: true,
-        status
-      });
-    }
-
-    const order = await applyPaidCreditOrder(orderId);
-
-    return res.json({
-      ok: true,
-      order
-    });
-
+    const authHeader = req.headers.authorization || "";
+    const accessToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!accessToken) return res.status(401).json({ error: "Belum login." });
+    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) return res.status(401).json({ error: "Sesi login tidak valid." });
+    const { data, error } = await supabase
+      .from("credit_order_simulations")
+      .select("id,credits,amount,currency,status,created_at,updated_at,paid_at,failure_reason")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(30);
+    if (error) throw error;
+    return res.json({ ok: true, orders: data || [], simulation: true });
   } catch (error) {
-    console.error("Payment webhook error:", error);
-
-    return res.status(500).json({
-      error: "Gagal memproses pembayaran."
-    });
+    console.error("Credit simulation history error:", error);
+    return res.status(500).json({ error: "Gagal membaca riwayat simulasi. Pastikan migrasi Supabase sudah diterapkan." });
   }
+});
+
+app.post("/api/credit-order-simulations", async (req, res) => {
+  if (!PAYMENT_SIMULATION_ENABLED) return res.status(503).json({ error: "Mode simulasi pembayaran belum diaktifkan pada backend." });
+  try {
+    const authHeader = req.headers.authorization || "";
+    const accessToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!accessToken) return res.status(401).json({ error: "Belum login." });
+    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) return res.status(401).json({ error: "Sesi login tidak valid." });
+
+    const credits = Number(req.body?.credits);
+    const currency = String(req.body?.currency || "IDR").toUpperCase();
+    const allowedCredits = [50, 120, 300, 500, 1000];
+    if (!allowedCredits.includes(credits)) return res.status(400).json({ error: "Paket kredit tidak valid." });
+    if (!Object.prototype.hasOwnProperty.call(CREDIT_ORDER_PRICES, currency)) return res.status(400).json({ error: "Mata uang belum didukung." });
+    const amount = CREDIT_ORDER_PRICES[currency][credits];
+
+    const { data: order, error } = await supabase
+      .from("credit_order_simulations")
+      .insert({ user_id: user.id, credits, amount, currency, status: "pending", payment_mode: "simulation" })
+      .select("id,credits,amount,currency,status,created_at,updated_at,paid_at,failure_reason")
+      .single();
+    if (error) throw error;
+    return res.status(201).json({ ok: true, simulation: true, creditsAdded: 0, order });
+  } catch (error) {
+    console.error("Create credit simulation error:", error);
+    return res.status(500).json({ error: "Gagal membuat pesanan simulasi. Pastikan migrasi Supabase sudah diterapkan." });
+  }
+});
+
+app.post("/api/credit-order-simulations/:id/resolve", async (req, res) => {
+  if (!PAYMENT_SIMULATION_ENABLED) return res.status(503).json({ error: "Mode simulasi pembayaran belum diaktifkan pada backend." });
+  try {
+    const authHeader = req.headers.authorization || "";
+    const accessToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!accessToken) return res.status(401).json({ error: "Belum login." });
+    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) return res.status(401).json({ error: "Sesi login tidak valid." });
+
+    const orderId = String(req.params.id || "").trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(orderId)) {
+      return res.status(400).json({ error: "ID pesanan simulasi tidak valid." });
+    }
+    const outcome = String(req.body?.outcome || "").toLowerCase();
+    if (! ["paid", "failed"].includes(outcome)) return res.status(400).json({ error: "Hasil simulasi harus paid atau failed." });
+
+    const { data: existing, error: readError } = await supabase
+      .from("credit_order_simulations")
+      .select("id,user_id,credits,amount,currency,status,created_at,updated_at,paid_at,failure_reason")
+      .eq("id", orderId)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (readError) throw readError;
+    if (!existing) return res.status(404).json({ error: "Pesanan simulasi tidak ditemukan." });
+    if (existing.status !== "pending") {
+      return res.json({ ok: true, simulation: true, alreadyResolved: true, creditsAdded: 0, order: existing });
+    }
+
+    const patch = {
+      status: outcome,
+      updated_at: new Date().toISOString(),
+      paid_at: outcome === "paid" ? new Date().toISOString() : null,
+      failure_reason: outcome === "failed" ? "Simulated payment failure (no real transaction)" : null
+    };
+    const { data: updated, error: updateError } = await supabase
+      .from("credit_order_simulations")
+      .update(patch)
+      .eq("id", orderId)
+      .eq("user_id", user.id)
+      .eq("status", "pending")
+      .select("id,credits,amount,currency,status,created_at,updated_at,paid_at,failure_reason")
+      .maybeSingle();
+    if (updateError) throw updateError;
+    if (!updated) {
+      const { data: current, error: currentError } = await supabase
+        .from("credit_order_simulations")
+        .select("id,credits,amount,currency,status,created_at,updated_at,paid_at,failure_reason")
+        .eq("id", orderId)
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (currentError) throw currentError;
+      if (!current) return res.status(404).json({ error: "Pesanan simulasi tidak ditemukan." });
+      return res.json({ ok: true, simulation: true, alreadyResolved: true, creditsAdded: 0, order: current });
+    }
+    // Intentional: do not call applyPaidCreditOrder(orderId) here. Simulation must not affect real credits.
+    return res.json({ ok: true, simulation: true, creditsAdded: 0, order: updated });
+  } catch (error) {
+    console.error("Resolve credit simulation error:", error);
+    return res.status(500).json({ error: "Gagal memperbarui status pesanan simulasi." });
+  }
+});
+
+app.post("/api/payment-webhook", (_req, res) => {
+  // Fail closed unconditionally. A client-supplied paid status or shared token
+  // is not proof of payment. Add a provider-specific verifier before real use.
+  return res.status(503).json({
+    error: "Webhook pembayaran nyata belum tersedia. Simulasi tidak memerlukan webhook ini."
+  });
 });
 
 app.use((_req, res) => {
