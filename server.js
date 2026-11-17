@@ -14,22 +14,6 @@ const supabase = createClient(
   process.env.SUPABASE_SECRET_KEY
 );
 
-async function consumeFreeVideoTrial(userId) {
-  const { data, error } = await supabase.rpc(
-    "consume_free_video_trial",
-    {
-      p_user_id: userId
-    }
-  );
-
-  if (error) {
-    throw error;
-  }
-
-  return data === true;
-}
-
-
 function findMp4Box(buffer, start, end, targetType) {
   let offset = start;
   while (offset + 8 <= end) {
@@ -164,7 +148,33 @@ const generateLimiter = rateLimit({
 });
 
 const DEFAULT_MODEL = "alibaba/wan-3.0-prime/image-to-video";
+const DRAMA_GENERATION_ENABLED = process.env.DRAMA_GENERATION_ENABLED === "true";
 
+function calculateDramaReferenceCredits(model, resolution, duration) {
+  const seconds = Number(duration);
+  let costUsd = null;
+  if (model === "bytedance/seedance-2.5/flash/reference-to-video") {
+    const pixels = resolution === "480p" ? 864 * 496 : resolution === "720p" ? 1280 * 720 : null;
+    if (!pixels) return null;
+    const outputTokens = Math.ceil((pixels * seconds * 24) / 1024);
+    costUsd = (outputTokens / 1000) * 0.014;
+  } else if (model === "alibaba/wan-3.0/reference-to-video") {
+    costUsd = ({ "480p": 0.05, "720p": 0.10, "1080p": 0.20 })[resolution] * seconds;
+  } else if (model === "alibaba/wan-3.0-prime/reference-to-video") {
+    costUsd = ({ "480p": 0.068, "720p": 0.14, "1080p": 0.28 })[resolution] * seconds;
+  } else if (model === "google/gemini-omni-flash/v1.1/reference-to-video") {
+    costUsd = ({ "360p": 0.03, "720p": 0.10, "1080p": 0.15 })[resolution] * seconds;
+  }
+  if (!Number.isFinite(costUsd) || costUsd <= 0) return null;
+  return Math.ceil(costUsd * 100 * 1.30);
+}
+
+const DRAMA_REFERENCE_MODELS = new Set([
+  "bytedance/seedance-2.5/flash/reference-to-video",
+  "alibaba/wan-3.0/reference-to-video",
+  "alibaba/wan-3.0-prime/reference-to-video",
+  "google/gemini-omni-flash/v1.1/reference-to-video"
+]);
 
 const ALLOWED_MODELS = new Set([
   "alibaba/wan-3.0-prime/image-to-video",
@@ -179,6 +189,9 @@ const ALLOWED_MODELS = new Set([
   "google/gemini-omni-flash/image-to-video",
   "google/gemini-omni-flash/v1.1/reference-to-video",
   "google/gemini-omni-flash/v1.1/edit",
+  "bytedance/seedance-2.5/flash/reference-to-video",
+  "alibaba/wan-3.0/reference-to-video",
+  "alibaba/wan-3.0-prime/reference-to-video",
 ]);
 
 const allowedRatios = new Set([
@@ -381,6 +394,7 @@ app.post("/api/generate", generateLimiter, async (req, res) => {
 let creditWasConsumed = false;
 let creditUserId = null;
 let creditRequestId = null;
+let creditAmountToRefund = null;
 let falRequestId = null;
 let falModel = null;
 let recoveryData = null;
@@ -415,6 +429,14 @@ if (authError || !user) {
 
 creditUserId = user.id;
 
+// Emergency switch: DEMO_MODE blocks every generation request before project lookup,
+// file uploads, credit deduction, or fal.ai calls. Demo sample videos are disabled.
+if (DEMO_MODE) {
+  return res.status(503).json({
+    error: "Generasi video sedang dinonaktifkan sementara (DEMO_MODE). Tidak ada file yang diunggah atau kredit yang dipotong."
+  });
+}
+
 const {
   prompt,
   ratio,
@@ -437,12 +459,25 @@ const isMiniMaxReframeModel = model === "minimax/h3-max/reframe-video";
 const isGeminiImageModel = model === "google/gemini-omni-flash/image-to-video";
 const isWanReferenceModel = model === "wan/v2.6/reference-to-video/flash";
 const isGeminiReferenceModel = model === "google/gemini-omni-flash/v1.1/reference-to-video";
-const isReferenceModel = isWanReferenceModel || isGeminiReferenceModel || isMiniMaxReferenceModel;
 const isWanVideoToVideoModel = model === "fal-ai/wan/v2.2-a14b/video-to-video";
 const isGeminiEditModel = model === "google/gemini-omni-flash/v1.1/edit";
+const isSeedanceReferenceModel = model === "bytedance/seedance-2.5/flash/reference-to-video";
+const isWan30ReferenceModel = model === "alibaba/wan-3.0/reference-to-video";
+const isWan30PrimeReferenceModel = model === "alibaba/wan-3.0-prime/reference-to-video";
+const isDramaReferenceModel = DRAMA_REFERENCE_MODELS.has(model);
+const isReferenceModel = isWanReferenceModel || isGeminiReferenceModel || isMiniMaxReferenceModel || isDramaReferenceModel;
 const isVideoToVideoModel = isWanVideoToVideoModel || isGeminiEditModel || isMiniMaxReframeModel;
+if (isDramaReferenceModel && !DRAMA_GENERATION_ENABLED) {
+  return res.status(503).json({
+    error: "Generasi Drama AI belum diaktifkan. Pilihan model dan proyek bisa disimpan, tetapi permintaan video belum dikirim dan kredit tidak dipotong."
+  });
+}
 let projectIdForDb = null;
 let sceneNumberForDb = null;
+
+if (typeof prompt !== "string" || !prompt.trim() || prompt.trim().length > 50000) {
+  return res.status(400).json({ error: "Prompt harus berupa teks dan tidak boleh kosong atau lebih dari 50.000 karakter." });
+}
 
 if (projectId !== null && projectId !== "") {
   if (
@@ -506,7 +541,10 @@ const invalidDuration = !isMiniMaxReframeModel && (
   (isH3Model && ![5, 10, 15].includes(videoDuration)) ||
   (isGeminiImageModel && ![5, 10].includes(videoDuration)) ||
   (isMiniMaxReferenceModel && ![5, 10, 15].includes(videoDuration)) ||
-  (isReferenceModel && !isMiniMaxReferenceModel && ![5, 10].includes(videoDuration)) ||
+  (isSeedanceReferenceModel && (videoDuration < 4 || videoDuration > 30)) ||
+  ((isWan30ReferenceModel || isWan30PrimeReferenceModel) && (videoDuration < 2 || videoDuration > 30)) ||
+  (isGeminiReferenceModel && videoDuration !== 10) ||
+  (isReferenceModel && !isMiniMaxReferenceModel && !isDramaReferenceModel && ![5, 10].includes(videoDuration)) ||
   (isGeminiEditModel && ![5, 10].includes(videoDuration)) ||
   (isWanVideoToVideoModel && ![5, 10].includes(videoDuration)) ||
   (!isVeoModel && !isH3Model && !isGeminiImageModel && !isReferenceModel && !isVideoToVideoModel && (videoDuration < 2 || videoDuration > 30))
@@ -520,6 +558,12 @@ if (invalidDuration) {
       ? "Durasi MiniMax H3 Max Turbo harus 5, 10, atau 15 detik."
       : isMiniMaxReferenceModel
       ? "Durasi MiniMax H3 Max Reference to Video harus 5, 10, atau 15 detik."
+      : isSeedanceReferenceModel
+      ? "Durasi Seedance 2.5 Flash harus 4–30 detik."
+      : (isWan30ReferenceModel || isWan30PrimeReferenceModel)
+      ? "Durasi Wan 3.0 Reference harus 2–30 detik."
+      : isGeminiReferenceModel
+      ? "Durasi Gemini Omni Flash 1.1 di Drama AI saat ini ditetapkan 10 detik."
       : (isGeminiImageModel || (isReferenceModel && !isMiniMaxReferenceModel) || isVideoToVideoModel)
       ? "Durasi model ini harus 5 atau 10 detik."
       : "Durasi harus antara 2 dan 30 detik."
@@ -566,6 +610,13 @@ if (isGeminiImageModel && resolution !== "720p") {
   return res.status(400).json({
     error: "Gemini Omni Flash Image to Video saat ini memakai resolusi 720p."
   });
+}
+
+if (isSeedanceReferenceModel && !["480p", "720p"].includes(resolution)) {
+  return res.status(400).json({ error: "Seedance 2.5 Flash Reference mendukung resolusi 480p atau 720p." });
+}
+if ((isWan30ReferenceModel || isWan30PrimeReferenceModel) && !["480p", "720p", "1080p"].includes(resolution)) {
+  return res.status(400).json({ error: "Wan 3.0 Reference mendukung resolusi 480p, 720p, atau 1080p." });
 }
 
 if ((isH3Model || isMiniMaxReferenceModel) && !["480p", "768p", "1080p"].includes(resolution)) {
@@ -652,68 +703,15 @@ falModel = model;
   }
 };
 
-let creditAmount = isMiniMaxReframeModel
+let creditAmount = isDramaReferenceModel
+  ? calculateDramaReferenceCredits(model, resolution, videoDuration)
+  : isMiniMaxReframeModel
   ? null
   : creditCosts[model]?.[resolution]?.[videoDuration];
 
 if (!creditAmount && !isMiniMaxReframeModel) {
   return res.status(400).json({
     error: "Kombinasi model, resolusi, dan durasi tidak tersedia."
-  });
-}
- 
-let freeTrial = false;
-let demoCreditConsumed = false;
-
-if (
-  DEMO_MODE &&
-  !isReferenceModel &&
-  !isVideoToVideoModel
-) {
-  freeTrial = await consumeFreeVideoTrial(user.id);
-
-  if (!freeTrial) {
-    return res.status(403).json({
-      error: "Free Trial sudah habis."
-    });
-  }
-
-  demoCreditConsumed = true;
-
-  const demoVideoUrl =
-    "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
-
-  const { error: demoHistoryError } = await supabase
-    .from("video_history")
-    .insert({
-      user_id: user.id,
-      prompt: prompt.trim(),
-      video_url: demoVideoUrl,
-      source_image_url: null,
-      ratio,
-      duration: videoDuration,
-      resolution,
-     project_id: projectIdForDb,
-     scene_number: sceneNumberForDb
-    });
-
-  if (demoHistoryError) {
-    console.error(
-      "Gagal menyimpan riwayat demo:",
-      demoHistoryError
-    );
-  }
-
-  return res.json({
-    ok: true,
-    requestId: `demo-${Date.now()}`,
-    video: {
-      url: demoVideoUrl
-    },
-    duration: videoDuration,
-    actualPrompt: prompt.trim(),
-    freeTrial,
-    creditConsumed: demoCreditConsumed
   });
 }
  
@@ -724,21 +722,28 @@ let sourceVideoUrl = null;
 let actualVideoDuration = videoDuration;
  
 if (isReferenceModel) {
+  const maxReferenceImages = isDramaReferenceModel ? 10 : 5;
+  const maxReferenceVideos = isDramaReferenceModel ? 0 : 3;
+  const maxReferenceTotal = isDramaReferenceModel ? 10 : 5;
   if (
     !Array.isArray(referenceImages) ||
     !Array.isArray(referenceVideos) ||
-    referenceImages.length > 5 ||
-    referenceVideos.length > 3 ||
-    referenceImages.length + referenceVideos.length > 5
+    referenceImages.length > maxReferenceImages ||
+    referenceVideos.length > maxReferenceVideos ||
+    referenceImages.length + referenceVideos.length > maxReferenceTotal
   ) {
     return res.status(400).json({
-      error: "Maksimal 5 referensi total, termasuk maksimal 3 video."
+      error: isDramaReferenceModel
+        ? "Drama AI menerima maksimal 10 gambar referensi per Scene. Video/audio referensi belum didukung oleh editor Drama AI."
+        : "Maksimal 5 referensi total, termasuk maksimal 3 video."
     });
   }
 
   if (referenceImages.length + referenceVideos.length === 0) {
     return res.status(400).json({
-      error: "Unggah minimal satu gambar atau video referensi."
+      error: isDramaReferenceModel
+        ? "Pilih minimal satu gambar karakter atau lokasi untuk Scene ini."
+        : "Unggah minimal satu gambar atau video referensi."
     });
   }
 
@@ -976,6 +981,7 @@ if (isReferenceModel) {
   }
      }  
 
+creditAmountToRefund = creditAmount;
 creditRequestId = randomUUID();
 
 const { error: requestInsertError } = await supabase
@@ -1040,7 +1046,39 @@ if (!creditConsumed) {
 
 creditWasConsumed = true;
  
-const falInput = isMiniMaxReframeModel
+const orderedReferencePrompt = isSeedanceReferenceModel
+  ? `${prompt.trim()}\n\nGunakan gambar referensi sesuai urutan unggahan: @Image1, @Image2, dan seterusnya. Pertahankan identitas karakter, pakaian, serta ciri lokasi sesuai gambar masing-masing.`
+  : (isWan30ReferenceModel || isWan30PrimeReferenceModel)
+  ? `${prompt.trim()}\n\nGunakan gambar referensi sesuai urutan unggahan: Image 1, Image 2, dan seterusnya. Pertahankan identitas karakter, pakaian, serta ciri lokasi sesuai gambar masing-masing.`
+  : isGeminiReferenceModel
+  ? `${prompt.trim()}\n\nGunakan gambar referensi sesuai urutan: <IMAGE_REF_0>, <IMAGE_REF_1>, dan seterusnya. Pertahankan identitas karakter, pakaian, serta ciri lokasi sesuai referensi.`
+  : prompt.trim();
+
+const falInput = isSeedanceReferenceModel
+  ? {
+      prompt: orderedReferencePrompt,
+      task: "reference",
+      image_urls: referenceImageUrls,
+      resolution,
+      aspect_ratio: ratio,
+      duration: videoDuration,
+      generate_audio: Boolean(audio)
+    }
+  : (isWan30ReferenceModel || isWan30PrimeReferenceModel)
+  ? {
+      prompt: orderedReferencePrompt,
+      reference_image_urls: referenceImageUrls,
+      reference_video_urls: [],
+      reference_audio_urls: [],
+      resolution,
+      aspect_ratio: ratio,
+      duration: videoDuration,
+      audio: Boolean(audio),
+      enable_prompt_expansion: true,
+      enable_thinking: false,
+      enable_safety_checker: true
+    }
+  : isMiniMaxReframeModel
   ? {
       prompt: prompt.trim(),
       video_url: sourceVideoUrl,
@@ -1076,7 +1114,7 @@ const falInput = isMiniMaxReframeModel
     }
   : isGeminiReferenceModel
   ? {
-      prompt: prompt.trim(),
+      prompt: orderedReferencePrompt,
       image_urls: referenceImageUrls,
       reference_video_urls: referenceVideoUrls,
       resolution,
@@ -1205,7 +1243,8 @@ const { error: requestUpdateError } = await supabase
     status: "succeeded",
     error_message: null
   })
-  .eq("credit_request_id", creditRequestId);
+  .eq("credit_request_id", creditRequestId)
+  .in("status", ["submitted", "processing", "unknown"]);
 
 if (requestUpdateError) {
   console.error(
@@ -1234,7 +1273,8 @@ if (creditRequestId) {
         error?.message || "Status hasil video belum dapat dipastikan."
       )
     })
-    .eq("credit_request_id", creditRequestId);
+    .eq("credit_request_id", creditRequestId)
+    .in("status", ["submitted", "processing"]);
 
   if (statusUpdateError) {
     console.error(
@@ -1251,6 +1291,40 @@ if (creditRequestId) {
             logs: true
           });
           
+if (falStatus.status === "COMPLETED" && (falStatus.error || falStatus.error_type)) {
+  const failureMessage = String(falStatus.error || falStatus.error_type || "fal.ai mengonfirmasi permintaan gagal.");
+  const { error: failedStatusError } = await supabase
+    .from("video_generation_requests")
+    .update({ status: "failed_confirmed", error_message: failureMessage })
+    .eq("credit_request_id", creditRequestId)
+    .in("status", ["submitted", "processing", "unknown"]);
+  if (failedStatusError) {
+    console.error("Gagal mencatat kegagalan yang dikonfirmasi fal.ai:", failedStatusError);
+  }
+
+  let refundCreated = false;
+  if (Number.isInteger(creditAmountToRefund) && creditAmountToRefund > 0) {
+    const { data: refundResult, error: refundError } = await supabase.rpc("refund_credit_for_request", {
+      p_user_id: creditUserId,
+      p_amount: creditAmountToRefund,
+      p_request_id: creditRequestId
+    });
+    if (refundError) {
+      console.error("fal.ai mengonfirmasi kegagalan, tetapi pengembalian kredit perlu diperiksa:", refundError);
+    } else {
+      refundCreated = refundResult === true;
+      if (!refundCreated) {
+        console.warn("RPC refund tidak membuat transaksi baru; mungkin sudah diproses atau debit tidak ditemukan.", { creditRequestId });
+      }
+    }
+  }
+
+  return res.status(502).json({
+    error: "fal.ai mengonfirmasi permintaan video gagal. Status pengembalian kredit telah diperiksa.",
+    creditRefunded: refundCreated
+  });
+}
+
 if (falStatus.status === "COMPLETED") {
   try {
     const falResult = await fal.queue.result(falModel, {
@@ -1307,7 +1381,8 @@ if (falStatus.status === "COMPLETED") {
           status: "succeeded",
           error_message: null
         })
-        .eq("credit_request_id", creditRequestId);
+        .eq("credit_request_id", creditRequestId)
+        .in("status", ["submitted", "processing", "unknown"]);
 
       if (recoveryStatusError) {
         throw recoveryStatusError;
