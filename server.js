@@ -462,8 +462,15 @@ const isGeminiReferenceModel = model === "google/gemini-omni-flash/v1.1/referenc
 const isWanVideoToVideoModel = model === "fal-ai/wan/v2.2-a14b/video-to-video";
 const isGeminiEditModel = model === "google/gemini-omni-flash/v1.1/edit";
 const isSeedanceReferenceModel = model === "bytedance/seedance-2.5/flash/reference-to-video";
+const isWan30ImageModel = model === "alibaba/wan-3.0/image-to-video";
+const isWan30PrimeImageModel = model === "alibaba/wan-3.0-prime/image-to-video";
 const isWan30ReferenceModel = model === "alibaba/wan-3.0/reference-to-video";
 const isWan30PrimeReferenceModel = model === "alibaba/wan-3.0-prime/reference-to-video";
+if (model === "google/gemini-omni-flash/image-to-video" || model === "minimax/h3-max/reframe-video") {
+  return res.status(503).json({
+    error: "Model ini dinonaktifkan sementara sampai biaya API aktual dapat diverifikasi. Kredit tidak dipotong."
+  });
+}
 const isDramaReferenceModel = DRAMA_REFERENCE_MODELS.has(model);
 const isReferenceModel = isWanReferenceModel || isGeminiReferenceModel || isMiniMaxReferenceModel || isDramaReferenceModel;
 const isVideoToVideoModel = isWanVideoToVideoModel || isGeminiEditModel || isMiniMaxReframeModel;
@@ -542,7 +549,7 @@ const invalidDuration = !isMiniMaxReframeModel && (
   (isGeminiImageModel && ![5, 10].includes(videoDuration)) ||
   (isMiniMaxReferenceModel && ![5, 10, 15].includes(videoDuration)) ||
   (isSeedanceReferenceModel && (videoDuration < 4 || videoDuration > 30)) ||
-  ((isWan30ReferenceModel || isWan30PrimeReferenceModel) && (videoDuration < 2 || videoDuration > 30)) ||
+  ((isWan30ImageModel || isWan30PrimeImageModel || isWan30ReferenceModel || isWan30PrimeReferenceModel) && ![10, 15, 20, 25, 30].includes(videoDuration)) ||
   (isGeminiReferenceModel && videoDuration !== 10) ||
   (isReferenceModel && !isMiniMaxReferenceModel && !isDramaReferenceModel && ![5, 10].includes(videoDuration)) ||
   (isGeminiEditModel && ![5, 10].includes(videoDuration)) ||
@@ -625,7 +632,7 @@ if ((isH3Model || isMiniMaxReferenceModel) && !["480p", "768p", "1080p"].include
   });
 }
 
-if (isMiniMaxReframeModel && !["480p", "768p", "1080p"].includes(resolution)) {
+if (isMiniMaxReframeModel && !["480p", "768p"].includes(resolution)) {
   return res.status(400).json({
     error: "MiniMax H3 Max Reframe hanya mendukung resolusi 480p atau 768p."
   });
@@ -650,66 +657,57 @@ falModel = model;
 
  const creditCosts = {
   "alibaba/wan-3.0/image-to-video": {
-    "480p": { 5: 23, 10: 45, 15: 68 },
-    "720p": { 5: 45, 10: 90, 15: 135 },
-    "1080p": { 5: 90, 10: 179, 15: 269 }
+    "480p": {10:65,15:98,20:130,25:163,30:195},
+    "720p": {10:130,15:195,20:260,25:325,30:390},
+    "1080p": {10:260,15:390,20:520,25:650,30:780}
   },
-
   "alibaba/wan-3.0-prime/image-to-video": {
-    "480p": { 5: 31, 10: 61, 15: 92 },
-    "720p": { 5: 63, 10: 126, 15: 188 },
-    "1080p": { 5: 126, 10: 251, 15: 376 }
+    "480p": {10:89,15:133,20:177,25:221,30:266},
+    "720p": {10:182,15:273,20:364,25:455,30:546},
+    "1080p": {10:364,15:546,20:728,25:910,30:1092}
   },
-
   "wan/v2.6/image-to-video": {
-    "720p": { 5: 45, 10: 90, 15: 135 },
-    "1080p": { 5: 68, 10: 135, 15: 202 }
+    "720p": {5:65,10:130,15:195},
+    "1080p": {5:98,10:195,15:293}
   },
-"fal-ai/veo3.1/lite/image-to-video": {
-  "720p": { 4: 20, 6: 30, 8: 40 },
-  "1080p": { 4: 32, 6: 48, 8: 64 }
-},
+  "fal-ai/veo3.1/lite/image-to-video": {
+    "720p": {4:26,6:39,8:52},
+    "1080p": {4:42,6:63,8:84}
+  },
   "wan/v2.6/reference-to-video/flash": {
-  "720p": { 5: 50, 10: 100 },
-  "1080p": { 5: 75, 10: 150 }
-},
+    "720p": {5:65,10:130},
+    "1080p": {5:98,10:195}
+  },
   "fal-ai/wan/v2.2-a14b/video-to-video": {
-  "480p": { 5: 20, 10: 40 },
-  "580p": { 5: 25, 10: 50 },
-  "720p": { 5: 35, 10: 70 }
-},
+    "480p": {5:26,10:52},
+    "580p": {5:39,10:78},
+    "720p": {5:52,10:104}
+  },
   "minimax/h3-max-turbo/image-to-video": {
-    "480p": { 5: 12, 10: 22, 15: 32 },
-    "768p": { 5: 19, 10: 34, 15: 50 },
-    "1080p": { 5: 37, 10: 68, 15: 100 }
+    "480p": {5:17,10:33,15:49},
+    "768p": {5:26,10:52,15:78},
+    "1080p": {5:52,10:104,15:156}
   },
   "minimax/h3-max/reference-to-video": {
-    "480p": { 5: 25, 10: 50, 15: 75 },
-    "768p": { 5: 40, 10: 80, 15: 120 },
-    "1080p": { 5: 80, 10: 160, 15: 240 }
-  },
-  "google/gemini-omni-flash/image-to-video": {
-    "720p": { 5: 60, 10: 120 }
+    "480p": {5:33,10:65,15:98},
+    "768p": {5:52,10:104,15:156},
+    "1080p": {5:104,10:208,15:312}
   },
   "google/gemini-omni-flash/v1.1/reference-to-video": {
-    "360p": { 5: 13, 10: 26 },
-    "720p": { 5: 42, 10: 84 },
-    "1080p": { 5: 63, 10: 125 }
+    "360p": {10:39}, "720p": {10:130}, "1080p": {10:195}
   },
   "google/gemini-omni-flash/v1.1/edit": {
-    "360p": { 5: 13, 10: 26 },
-    "720p": { 5: 42, 10: 84 },
-    "1080p": { 5: 63, 10: 125 }
+    "360p": {5:20,10:39},
+    "720p": {5:65,10:130},
+    "1080p": {5:98,10:195}
   }
 };
 
 let creditAmount = isDramaReferenceModel
   ? calculateDramaReferenceCredits(model, resolution, videoDuration)
-  : isMiniMaxReframeModel
-  ? null
   : creditCosts[model]?.[resolution]?.[videoDuration];
 
-if (!creditAmount && !isMiniMaxReframeModel) {
+if (!creditAmount) {
   return res.status(400).json({
     error: "Kombinasi model, resolusi, dan durasi tidak tersedia."
   });
@@ -798,10 +796,15 @@ if (isReferenceModel) {
     }
 
     const extraTokens = Math.max(0, referenceTokens - 4096);
-    // fal.ai bills $0.02 per 1,000 reference tokens after a 4,096-token allowance.
-    // Movira's existing MiniMax price uses a 2x output-cost factor; apply it to this surcharge too.
-    const referenceInputCredits = Math.ceil((extraTokens / 1000) * 2);
-    creditAmount += referenceInputCredits;
+    // Combine output and reference API costs first, then apply the 30% margin and round once.
+    const outputRates = { "480p": 0.05, "768p": 0.08, "1080p": 0.16 };
+    const outputRate = outputRates[resolution];
+    const referenceCostUsd = (extraTokens / 1000) * 0.02;
+    const totalCostUsd = outputRate * videoDuration + referenceCostUsd;
+    creditAmount = Number.isFinite(outputRate) ? Math.ceil(totalCostUsd * 130) : null;
+    if (!creditAmount) {
+      return res.status(400).json({ error: "Kombinasi resolusi dan biaya referensi tidak tersedia." });
+    }
   }
 
   const uploadReference = async (dataUrl, allowedTypes) => {
@@ -914,7 +917,7 @@ if (isReferenceModel) {
       });
     }
     actualVideoDuration = Math.ceil(sourceDurationSeconds);
-    const creditsPerSecond = { "480p": 5, "768p": 8, "1080p": 16 }[resolution];
+    const creditsPerSecond = { "480p": 5, "768p": 8 }[resolution];
     creditAmount = actualVideoDuration * creditsPerSecond;
     if (!Number.isInteger(creditAmount) || creditAmount < 1) {
       return res.status(400).json({
@@ -1098,6 +1101,8 @@ const falInput = isSeedanceReferenceModel
       prompt: prompt.trim(),
       resolution,
       aspect_ratio: ratio,
+      num_frames: Math.round(videoDuration * 16),
+      frames_per_second: 16,
       num_inference_steps: 27,
       enable_safety_checker: true
     }
