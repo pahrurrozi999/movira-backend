@@ -166,7 +166,7 @@ function calculateDramaReferenceCredits(model, resolution, duration) {
     costUsd = ({ "360p": 0.03, "720p": 0.10, "1080p": 0.15 })[resolution] * seconds;
   }
   if (!Number.isFinite(costUsd) || costUsd <= 0) return null;
-  return Math.ceil(costUsd * 100 * 1.30);
+  return Math.ceil((costUsd * 130) - 1e-9);
 }
 
 const DRAMA_REFERENCE_MODELS = new Set([
@@ -214,6 +214,411 @@ app.get("/api/health", (_req, res) => {
     service: "Movira backend",
     version: "0.2.0"
   });
+});
+
+
+// ===== Drama AI batch generation =====
+// This endpoint uses a single credit debit for the selected batch. The SQL migration
+// shipped with this update creates the durable batch/scene status tables.
+const dramaBatchLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 3,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "Terlalu banyak permintaan Drama AI. Coba lagi sebentar." }
+});
+
+const DRAMA_BATCH_MODELS = Object.freeze({
+  "bytedance/seedance-2.5/flash/reference-to-video": {
+    resolutions: ["480p", "720p"], durations: [10, 15, 30], maxImages: 10, pricing: "seedance"
+  },
+  "alibaba/wan-3.0/reference-to-video": {
+    resolutions: ["480p", "720p", "1080p"], durations: [10, 15, 30], maxImages: 10,
+    pricing: { "480p": 0.05, "720p": 0.10, "1080p": 0.20 }
+  },
+  "alibaba/wan-3.0-prime/reference-to-video": {
+    resolutions: ["480p", "720p", "1080p"], durations: [10, 15, 30], maxImages: 10,
+    pricing: { "480p": 0.068, "720p": 0.14, "1080p": 0.28 }
+  },
+  "google/gemini-omni-flash/v1.1/reference-to-video": {
+    resolutions: ["360p", "720p", "1080p"], durations: [10], maxImages: 10,
+    pricing: { "360p": 0.03, "720p": 0.10, "1080p": 0.15 }
+  }
+});
+
+function dramaCreditsFromUsd(totalUsd) {
+  // Avoid a one-credit overcharge when decimal rates land just above an integer
+  // solely because of IEEE-754 floating-point representation.
+  return Math.ceil((Number(totalUsd) * 130) - 1e-9);
+}
+
+function calculateDramaBatchSceneCostUsd(model, resolution, duration) {
+  const config = DRAMA_BATCH_MODELS[model];
+  const seconds = Number(duration);
+  if (!config || !Number.isInteger(seconds) || !config.durations.includes(seconds) || !config.resolutions.includes(resolution)) return null;
+  if (config.pricing === "seedance") {
+    const pixels = resolution === "480p" ? 864 * 496 : resolution === "720p" ? 1280 * 720 : null;
+    if (!pixels) return null;
+    const outputTokens = Math.ceil((pixels * seconds * 24) / 1024);
+    const usd = (outputTokens / 1000) * 0.014;
+    return Number.isFinite(usd) && usd > 0 ? usd : null;
+  }
+  const usd = config.pricing[resolution] * seconds;
+  return Number.isFinite(usd) && usd > 0 ? usd : null;
+}
+
+async function authenticateDramaRequest(req) {
+  const authHeader = req.headers.authorization || "";
+  const accessToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!accessToken) return { error: "Silakan login terlebih dahulu.", status: 401 };
+  const { data: { user }, error } = await supabase.auth.getUser(accessToken);
+  if (error || !user) return { error: "Sesi login tidak valid.", status: 401 };
+  return { user };
+}
+
+function parseDramaImageDataUrl(dataUrl) {
+  if (typeof dataUrl !== "string") throw new Error("Data gambar referensi tidak valid.");
+  const match = dataUrl.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) throw new Error("Format gambar Drama AI harus JPG, PNG, atau WEBP.");
+  const buffer = Buffer.from(match[2], "base64");
+  if (!buffer.length || buffer.length > 10 * 1024 * 1024) throw new Error("Ukuran setiap gambar referensi maksimal 10 MB.");
+  return { mimeType: match[1].toLowerCase(), buffer };
+}
+
+async function uploadDramaImage(dataUrl, cache) {
+  if (cache.has(dataUrl)) return cache.get(dataUrl);
+  const { mimeType, buffer } = parseDramaImageDataUrl(dataUrl);
+  const extension = mimeType.split("/")[1].replace("jpeg", "jpg");
+  const file = new File([buffer], `movira-drama-reference.${extension}`, { type: mimeType });
+  const url = await fal.storage.upload(file);
+  cache.set(dataUrl, url);
+  return url;
+}
+
+function makeDramaFalInput(model, scene, imageUrls, userId) {
+  const basePrompt = String(scene.prompt || "").trim();
+  if (model === "bytedance/seedance-2.5/flash/reference-to-video") {
+    const prompt = `${basePrompt}\n\nGunakan gambar referensi sesuai urutan: @Image1, @Image2, dan seterusnya. Jaga konsistensi karakter, pakaian, dan lokasi.`;
+    return {
+      prompt, task: "reference", image_urls: imageUrls,
+      resolution: scene.resolution, aspect_ratio: scene.ratio,
+      duration: String(scene.duration), generate_audio: true, end_user_id: userId
+    };
+  }
+  if (model === "alibaba/wan-3.0/reference-to-video" || model === "alibaba/wan-3.0-prime/reference-to-video") {
+    const prompt = `${basePrompt}\n\nGunakan gambar referensi sesuai urutan: Image 1, Image 2, dan seterusnya. Jaga konsistensi karakter, pakaian, dan lokasi.`;
+    return {
+      prompt, reference_image_urls: imageUrls, reference_video_urls: [], reference_audio_urls: [],
+      resolution: scene.resolution, aspect_ratio: scene.ratio, duration: scene.duration,
+      audio: true, enable_prompt_expansion: true, enable_thinking: false, enable_safety_checker: true
+    };
+  }
+  if (model === "google/gemini-omni-flash/v1.1/reference-to-video") {
+    const prompt = `${basePrompt}\n\nGunakan gambar referensi sesuai urutan: <IMAGE_REF_0>, <IMAGE_REF_1>, dan seterusnya. Jaga konsistensi karakter, pakaian, dan lokasi.`;
+    // This endpoint schema does not expose a generate_audio boolean; audio is model-generated from prompt/context.
+    return { prompt, image_urls: imageUrls, aspect_ratio: scene.ratio, resolution: scene.resolution, duration: scene.duration };
+  }
+  throw new Error("Model Drama AI tidak dikenal.");
+}
+
+function batchIsTerminal(status) {
+  return ["succeeded", "failed_confirmed", "not_submitted", "unknown"].includes(status);
+}
+
+async function refreshDramaBatch(batchId, userId) {
+  const { data: batch, error: batchError } = await supabase
+    .from("drama_generation_batches").select("*").eq("id", batchId).eq("user_id", userId).maybeSingle();
+  if (batchError) throw batchError;
+  if (!batch) return null;
+  const { data: scenes, error: scenesError } = await supabase
+    .from("drama_generation_batch_scenes").select("*").eq("batch_id", batchId).order("scene_number", { ascending: true });
+  if (scenesError) throw scenesError;
+
+  for (const scene of scenes || []) {
+    if (!scene.fal_request_id || !["submitted", "processing"].includes(scene.status)) continue;
+    try {
+      const status = await fal.queue.status(scene.model, { requestId: scene.fal_request_id, logs: false });
+      const currentStatus = String(status?.status || "").toUpperCase();
+      if (currentStatus === "IN_QUEUE" || currentStatus === "IN_PROGRESS") {
+        if (scene.status !== "processing") {
+          await supabase.from("drama_generation_batch_scenes").update({ status: "processing", updated_at: new Date().toISOString() }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+        }
+      } else if (currentStatus === "FAILED") {
+        await supabase.from("drama_generation_batch_scenes").update({
+          status: "failed_confirmed", error_message: String(status?.error || status?.error_type || "fal.ai mengonfirmasi Scene gagal."), updated_at: new Date().toISOString()
+        }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+      } else if (currentStatus === "COMPLETED") {
+        const result = await fal.queue.result(scene.model, { requestId: scene.fal_request_id });
+        const videoUrl = result.data?.video?.url || result.data?.video?.video_url || (typeof result.data?.video === "string" ? result.data.video : null);
+        if (!videoUrl) {
+          await supabase.from("drama_generation_batch_scenes").update({ status: "unknown", error_message: "fal.ai menyatakan selesai tetapi URL video tidak ditemukan; kredit perlu ditinjau." , updated_at: new Date().toISOString() }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+          continue;
+        }
+        const { data: existing, error: existingError } = await supabase
+          .from("video_history").select("id").eq("user_id", userId).eq("video_url", videoUrl).limit(1);
+        if (existingError) throw existingError;
+        if (!existing || existing.length === 0) {
+          const { error: historyError } = await supabase.from("video_history").insert({
+            user_id: userId, prompt: scene.prompt, video_url: videoUrl,
+            source_image_url: Array.isArray(scene.reference_urls) ? (scene.reference_urls[0] || null) : null,
+            ratio: scene.ratio, duration: scene.duration, resolution: scene.resolution,
+            project_id: batch.project_id, scene_number: scene.scene_number
+          });
+          if (historyError) console.error("Gagal menyimpan riwayat Drama AI:", historyError);
+        }
+        await supabase.from("drama_generation_batch_scenes").update({
+          status: "succeeded", video_url: videoUrl, actual_prompt: result.data?.actual_prompt || null, updated_at: new Date().toISOString()
+        }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+      }
+    } catch (error) {
+      // A polling/network/result error is ambiguous. Keep the charge reserved; never auto-refund it.
+      console.error("Drama AI status check failed; charge remains reserved:", { batchId, sceneNumber: scene.scene_number, message: error?.message });
+    }
+  }
+
+  const { data: latestScenes, error: latestError } = await supabase
+    .from("drama_generation_batch_scenes").select("*").eq("batch_id", batchId).order("scene_number", { ascending: true });
+  if (latestError) throw latestError;
+  const finalScenes = latestScenes || [];
+  const allTerminal = finalScenes.length > 0 && finalScenes.every(item => batchIsTerminal(item.status));
+  if (allTerminal && batch.refund_status === "pending") {
+    const successAndUnknownUsd = finalScenes
+      .filter(item => item.status === "succeeded" || item.status === "unknown")
+      .reduce((sum, item) => sum + Number(item.cost_usd || 0), 0);
+    const keepCredits = dramaCreditsFromUsd(successAndUnknownUsd);
+    const refundCredits = Math.max(0, Number(batch.credit_amount || 0) - keepCredits);
+    const { data: claim, error: claimError } = await supabase
+      .from("drama_generation_batches")
+      .update({ refund_status: "processing", refund_amount: refundCredits, updated_at: new Date().toISOString() })
+      .eq("id", batchId).eq("refund_status", "pending").select("id").maybeSingle();
+    if (claimError) throw claimError;
+    if (claim) {
+      let refundOk = true;
+      if (refundCredits > 0) {
+        const { data: refundResult, error: refundError } = await supabase.rpc("refund_credit_for_request", {
+          p_user_id: userId, p_amount: refundCredits, p_request_id: batchId
+        });
+        refundOk = !refundError && refundResult === true;
+        if (refundError) console.error("Drama AI confirmed-failure refund error:", refundError);
+      }
+      await supabase.from("drama_generation_batches").update({
+        refund_status: refundOk ? "complete" : "error",
+        status: !refundOk ? "unknown" : finalScenes.every(item => item.status === "succeeded") ? "succeeded" : finalScenes.some(item => item.status === "succeeded") ? "partially_succeeded" : finalScenes.some(item => item.status === "unknown") ? "unknown" : "failed_confirmed",
+        updated_at: new Date().toISOString()
+      }).eq("id", batchId);
+      await supabase.from("video_generation_requests").update({
+        status: !refundOk ? "unknown" : finalScenes.some(item => item.status === "succeeded") ? "succeeded" : "failed_confirmed",
+        error_message: !refundOk ? "Pengembalian kredit batch perlu pemeriksaan manual." : null,
+        updated_at: new Date().toISOString()
+      }).eq("credit_request_id", batchId);
+    }
+  }
+
+  const { data: finalBatch, error: finalBatchError } = await supabase
+    .from("drama_generation_batches").select("*").eq("id", batchId).eq("user_id", userId).single();
+  if (finalBatchError) throw finalBatchError;
+  const done = finalScenes.length > 0 && finalScenes.every(item => batchIsTerminal(item.status)) && ["complete", "error"].includes(finalBatch.refund_status);
+  return { batch: finalBatch, scenes: finalScenes, done };
+}
+
+app.post("/api/drama-generate-batch", dramaBatchLimiter, async (req, res) => {
+  let userId = null;
+  let batchId = null;
+  let batchCreditsConsumed = false;
+  try {
+    const auth = await authenticateDramaRequest(req);
+    if (auth.error) return res.status(auth.status).json({ error: auth.error });
+    const user = auth.user;
+    userId = user.id;
+    if (DEMO_MODE) return res.status(503).json({ error: "Mode demo masih aktif. Permintaan Drama AI tidak dikirim dan kredit tidak dipotong." });
+    if (!DRAMA_GENERATION_ENABLED) return res.status(503).json({ error: "Drama AI belum diaktifkan pada konfigurasi backend." });
+
+    const projectId = req.body?.project_id;
+    const mode = req.body?.mode;
+    const activeIndex = Number(req.body?.active_scene_index);
+    if (typeof projectId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(projectId)) {
+      return res.status(400).json({ error: "ID proyek tidak valid. Simpan proyek terlebih dahulu." });
+    }
+    if (!["all", "active"].includes(mode)) return res.status(400).json({ error: "Pilihan generasi tidak valid." });
+    const clientRequestId = req.body?.client_request_id;
+    if (typeof clientRequestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clientRequestId)) {
+      return res.status(400).json({ error: "ID permintaan tidak valid. Muat ulang editor lalu coba lagi." });
+    }
+    const { data: priorBatch, error: priorBatchError } = await supabase.from("drama_generation_batches")
+      .select("id,credit_amount").eq("user_id", user.id).eq("client_request_id", clientRequestId).maybeSingle();
+    if (priorBatchError) throw priorBatchError;
+    if (priorBatch) {
+      const priorState = await refreshDramaBatch(priorBatch.id, user.id);
+      return res.status(200).json({ ok: true, reused: true, batch_id: priorBatch.id, credit_amount: priorBatch.credit_amount, batch: priorState?.batch, scenes: priorState?.scenes, done: priorState?.done || false });
+    }
+    const { data: project, error: projectError } = await supabase.from("projects")
+      .select("id,user_id,settings").eq("id", projectId).eq("user_id", user.id).maybeSingle();
+    if (projectError) throw projectError;
+    if (!project?.settings?.dramaAI || !Array.isArray(project.settings.dramaAI.scenes)) {
+      return res.status(404).json({ error: "Proyek Drama AI tidak ditemukan atau belum tersimpan." });
+    }
+    const drama = project.settings.dramaAI;
+    const allScenes = drama.scenes;
+    const selectedScenes = mode === "all" ? allScenes.map((scene, index) => ({ scene, index })) : Number.isInteger(activeIndex) && activeIndex >= 0 && activeIndex < allScenes.length ? [{ scene: allScenes[activeIndex], index: activeIndex }] : [];
+    if (!selectedScenes.length || selectedScenes.length > 30) return res.status(400).json({ error: "Jumlah Scene tidak valid. Maksimal 30 Scene per batch." });
+
+    const referenceImages = drama.referenceImages || {};
+    const refById = new Map();
+    for (const kind of ["character", "location"]) {
+      for (const item of Array.isArray(referenceImages[kind]) ? referenceImages[kind] : []) {
+        if (item?.id && item?.dataUrl) refById.set(String(item.id), item.dataUrl);
+      }
+    }
+    const prepared = [];
+    for (const entry of selectedScenes) {
+      const scene = entry.scene || {};
+      const model = String(scene.model || "");
+      const config = DRAMA_BATCH_MODELS[model];
+      const prompt = String(scene.prompt || "").trim();
+      const duration = Number(scene.duration);
+      const resolution = String(scene.resolution || "");
+      const ratio = String(scene.ratio || "");
+      if (!config || !prompt || prompt.length > 50000) return res.status(400).json({ error: `Prompt atau model Scene ${entry.index + 1} tidak valid.` });
+      if (!config.durations.includes(duration) || !config.resolutions.includes(resolution)) return res.status(400).json({ error: `Durasi atau resolusi Scene ${entry.index + 1} tidak didukung model.` });
+      if (!["16:9", "9:16"].includes(ratio)) return res.status(400).json({ error: `Rasio Scene ${entry.index + 1} harus 16:9 atau 9:16.` });
+      const ids = [...new Set([...(scene.characterReferenceIds || []), ...(scene.locationReferenceIds || [])].map(String))];
+      if (ids.length < 1 || ids.length > config.maxImages) return res.status(400).json({ error: `Scene ${entry.index + 1} harus memiliki 1–${config.maxImages} gambar referensi.` });
+      const dataUrls = ids.map(id => refById.get(id)).filter(Boolean);
+      if (dataUrls.length !== ids.length) return res.status(400).json({ error: `Ada gambar referensi yang hilang pada Scene ${entry.index + 1}. Buka dan simpan ulang proyek.` });
+      const costUsd = calculateDramaBatchSceneCostUsd(model, resolution, duration);
+      if (!Number.isFinite(costUsd) || costUsd <= 0) return res.status(400).json({ error: `Estimasi biaya Scene ${entry.index + 1} tidak tersedia.` });
+      prepared.push({ sceneNumber: entry.index + 1, model, prompt, duration, resolution, ratio, costUsd, dataUrls });
+    }
+
+    const totalCostUsd = prepared.reduce((sum, item) => sum + item.costUsd, 0);
+    const totalCredits = dramaCreditsFromUsd(totalCostUsd);
+    if (!Number.isInteger(totalCredits) || totalCredits < 1) return res.status(400).json({ error: "Total kredit tidak valid." });
+
+    // Upload all references before reserving credits. A failed upload cannot consume credits.
+    const uploadCache = new Map();
+    for (const item of prepared) {
+      item.referenceUrls = [];
+      for (const dataUrl of item.dataUrls) item.referenceUrls.push(await uploadDramaImage(dataUrl, uploadCache));
+      item.input = makeDramaFalInput(item.model, item, item.referenceUrls, user.id);
+    }
+
+    batchId = randomUUID();
+    const { error: batchInsertError } = await supabase.from("drama_generation_batches").insert({
+      id: batchId, user_id: user.id, project_id: projectId, mode, client_request_id: clientRequestId,
+      status: "submitted", total_cost_usd: totalCostUsd, credit_amount: totalCredits,
+      refund_amount: 0, refund_status: "pending"
+    });
+    if (batchInsertError?.code === "23505") {
+      const { data: racedBatch, error: racedBatchError } = await supabase.from("drama_generation_batches")
+        .select("id,credit_amount").eq("user_id", user.id).eq("client_request_id", clientRequestId).maybeSingle();
+      if (racedBatchError) throw racedBatchError;
+      if (racedBatch) {
+        const racedState = await refreshDramaBatch(racedBatch.id, user.id);
+        return res.status(200).json({ ok: true, reused: true, batch_id: racedBatch.id, credit_amount: racedBatch.credit_amount, batch: racedState?.batch, scenes: racedState?.scenes, done: racedState?.done || false });
+      }
+    }
+    if (batchInsertError) throw batchInsertError;
+    const sceneRows = prepared.map(item => ({
+      id: randomUUID(), batch_id: batchId, scene_number: item.sceneNumber, model: item.model,
+      prompt: item.prompt, resolution: item.resolution, duration: item.duration, ratio: item.ratio,
+      cost_usd: item.costUsd, status: "not_submitted", reference_urls: item.referenceUrls
+    }));
+    const { error: sceneInsertError } = await supabase.from("drama_generation_batch_scenes").insert(sceneRows);
+    if (sceneInsertError) {
+      await supabase.from("drama_generation_batches").update({ status: "failed_confirmed", refund_status: "complete", error_message: "Gagal menyiapkan daftar Scene sebelum pemotongan kredit." }).eq("id", batchId);
+      throw sceneInsertError;
+    }
+
+    const { error: requestInsertError } = await supabase.from("video_generation_requests").insert({
+      user_id: user.id, credit_request_id: batchId, model: prepared[0].model,
+      status: "submitted", credit_amount: totalCredits, project_id: null, scene_number: null
+    });
+    if (requestInsertError) {
+      await supabase.from("drama_generation_batches").update({ status: "failed_confirmed", refund_status: "complete", error_message: "Gagal mencatat permintaan sebelum debit kredit." }).eq("id", batchId);
+      return res.status(500).json({ error: "Gagal mencatat permintaan batch. Kredit belum dipotong.", batch_id: batchId });
+    }
+    const { data: consumed, error: consumeError } = await supabase.rpc("consume_credit_for_request", {
+      p_user_id: user.id, p_amount: totalCredits, p_request_id: batchId
+    });
+    if (consumeError) {
+      batchCreditsConsumed = true; // The RPC result is ambiguous; do not auto-refund.
+      await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "Status debit kredit perlu diperiksa." }).eq("id", batchId);
+      await supabase.from("video_generation_requests").update({ status: "unknown", error_message: "Status debit kredit perlu diperiksa." }).eq("credit_request_id", batchId);
+      return res.status(500).json({ error: "Status pemotongan kredit belum dapat dipastikan. Jangan ulangi Generate; periksa riwayat kredit terlebih dahulu.", batch_id: batchId });
+    }
+    if (!consumed) {
+      await supabase.from("drama_generation_batches").update({ status: "failed_confirmed", refund_status: "complete", error_message: "Kredit tidak cukup." }).eq("id", batchId);
+      await supabase.from("video_generation_requests").update({ status: "failed_confirmed", error_message: "Kredit tidak cukup." }).eq("credit_request_id", batchId);
+      return res.status(402).json({ error: "Kredit tidak cukup.", batch_id: batchId });
+    }
+    batchCreditsConsumed = true;
+
+    let submitStopped = false;
+    for (const item of prepared) {
+      const row = sceneRows.find(scene => scene.scene_number === item.sceneNumber);
+      if (submitStopped) {
+        const { error: notSubmittedError } = await supabase.from("drama_generation_batch_scenes").update({ status: "not_submitted", error_message: "Tidak dikirim karena pengiriman Scene sebelumnya mengalami status tidak pasti." }).eq("id", row.id);
+        if (notSubmittedError) {
+          await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "Status Scene yang belum dikirim gagal disimpan." }).eq("id", batchId);
+          return res.status(500).json({ error: "Status batch tidak dapat dipastikan. Jangan ulangi Generate; periksa kredit.", batch_id: batchId });
+        }
+        continue;
+      }
+      try {
+        const queued = await fal.queue.submit(item.model, { input: item.input });
+        const requestId = queued?.request_id || queued?.requestId;
+        if (!requestId) throw new Error("fal.ai tidak mengembalikan request ID.");
+        const { error: queueSaveError } = await supabase.from("drama_generation_batch_scenes").update({ status: "submitted", fal_request_id: requestId, updated_at: new Date().toISOString() }).eq("id", row.id);
+        if (queueSaveError) {
+          await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "fal.ai menerima antrean tetapi ID antrean gagal disimpan." }).eq("id", batchId);
+          return res.status(500).json({ error: "fal.ai menerima permintaan, tetapi pencatatan antrean gagal. Jangan Generate ulang; status kredit perlu diperiksa.", batch_id: batchId });
+        }
+      } catch (submitError) {
+        // No request ID means acceptance cannot be proven; retain that Scene's charge.
+        const { error: unknownSaveError } = await supabase.from("drama_generation_batch_scenes").update({ status: "unknown", error_message: String(submitError?.message || "Status pengiriman tidak dapat dipastikan."), updated_at: new Date().toISOString() }).eq("id", row.id);
+        if (unknownSaveError) {
+          await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "Status pengiriman dan pencatatan Scene tidak dapat dipastikan." }).eq("id", batchId);
+          return res.status(500).json({ error: "Status pengiriman tidak dapat dipastikan. Jangan ulangi Generate; periksa kredit.", batch_id: batchId });
+        }
+        submitStopped = true;
+      }
+    }
+    await supabase.from("drama_generation_batches").update({ status: "processing", updated_at: new Date().toISOString() }).eq("id", batchId);
+    await supabase.from("video_generation_requests").update({ status: "processing" }).eq("credit_request_id", batchId);
+    const initial = await refreshDramaBatch(batchId, user.id);
+    return res.status(202).json({ ok: true, batch_id: batchId, credit_amount: totalCredits, scene_count: prepared.length, batch: initial?.batch, scenes: initial?.scenes, done: initial?.done || false });
+  } catch (error) {
+    console.error("Drama AI batch creation error:", error);
+    let persistedBatchId = null;
+    if (batchId) {
+      const { data: persistedBatch, error: lookupError } = await supabase.from("drama_generation_batches")
+        .select("id").eq("id", batchId).eq("user_id", userId).maybeSingle();
+      if (!lookupError && persistedBatch) {
+        persistedBatchId = persistedBatch.id;
+        await supabase.from("drama_generation_batches").update({
+          status: batchCreditsConsumed ? "unknown" : "failed_confirmed",
+          refund_status: batchCreditsConsumed ? "error" : "complete",
+          error_message: String(error?.message || "Kesalahan batch tidak diketahui")
+        }).eq("id", batchId);
+      }
+    }
+    return res.status(500).json({ error: "Gagal menyiapkan batch Drama AI. Periksa status proyek dan kredit sebelum mencoba lagi.", ...(persistedBatchId ? { batch_id: persistedBatchId } : {}) });
+  }
+});
+
+app.get("/api/drama-generate-batch/:batchId", async (req, res) => {
+  try {
+    const auth = await authenticateDramaRequest(req);
+    if (auth.error) return res.status(auth.status).json({ error: auth.error });
+    const batchId = req.params.batchId;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(batchId)) return res.status(400).json({ error: "ID batch tidak valid." });
+    const result = await refreshDramaBatch(batchId, auth.user.id);
+    if (!result) return res.status(404).json({ error: "Batch Drama AI tidak ditemukan." });
+    return res.json({ ok: true, batch_id: batchId, batch: result.batch, scenes: result.scenes, done: result.done });
+  } catch (error) {
+    console.error("Drama AI batch status error:", error);
+    return res.status(500).json({ error: "Gagal memeriksa status Drama AI." });
+  }
 });
 
 app.get("/api/video-requests", async (req, res) => {
