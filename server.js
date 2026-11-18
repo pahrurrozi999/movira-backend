@@ -180,13 +180,12 @@ const ALLOWED_MODELS = new Set([
   "alibaba/wan-3.0-prime/image-to-video",
   "alibaba/wan-3.0/image-to-video",
   "wan/v2.6/image-to-video",
-  "fal-ai/veo3.1/lite/image-to-video",
   "wan/v2.6/reference-to-video/flash",
   "fal-ai/wan/v2.2-a14b/video-to-video",
   "minimax/h3-max-turbo/image-to-video",
   "minimax/h3-max/reference-to-video",
   "minimax/h3-max/reframe-video",
-  "google/gemini-omni-flash/image-to-video",
+  "google/gemini-omni-flash/v1.1/image-to-video",
   "google/gemini-omni-flash/v1.1/reference-to-video",
   "google/gemini-omni-flash/v1.1/edit",
   "bytedance/seedance-2.5/flash/reference-to-video",
@@ -456,7 +455,7 @@ const isVeoModel = model === "fal-ai/veo3.1/lite/image-to-video";
 const isH3Model = model === "minimax/h3-max-turbo/image-to-video";
 const isMiniMaxReferenceModel = model === "minimax/h3-max/reference-to-video";
 const isMiniMaxReframeModel = model === "minimax/h3-max/reframe-video";
-const isGeminiImageModel = model === "google/gemini-omni-flash/image-to-video";
+const isGeminiImageModel = model === "google/gemini-omni-flash/v1.1/image-to-video";
 const isWanReferenceModel = model === "wan/v2.6/reference-to-video/flash";
 const isGeminiReferenceModel = model === "google/gemini-omni-flash/v1.1/reference-to-video";
 const isWanVideoToVideoModel = model === "fal-ai/wan/v2.2-a14b/video-to-video";
@@ -466,7 +465,21 @@ const isWan30ImageModel = model === "alibaba/wan-3.0/image-to-video";
 const isWan30PrimeImageModel = model === "alibaba/wan-3.0-prime/image-to-video";
 const isWan30ReferenceModel = model === "alibaba/wan-3.0/reference-to-video";
 const isWan30PrimeReferenceModel = model === "alibaba/wan-3.0-prime/reference-to-video";
-if (model === "google/gemini-omni-flash/image-to-video" || model === "minimax/h3-max/reframe-video") {
+const isDramaRequest = req.body?.drama_ai === true;
+const DRAMA_ONLY_MODELS = new Set([
+  "bytedance/seedance-2.5/flash/reference-to-video",
+  "alibaba/wan-3.0/reference-to-video",
+  "alibaba/wan-3.0-prime/reference-to-video"
+]);
+if (DRAMA_ONLY_MODELS.has(model) && !isDramaRequest) {
+  return res.status(400).json({
+    error: "Model ini hanya tersedia melalui fitur Drama AI."
+  });
+}
+if (isDramaRequest && !DRAMA_REFERENCE_MODELS.has(model)) {
+  return res.status(400).json({ error: "Model Drama AI tidak valid." });
+}
+if (model === "minimax/h3-max/reframe-video") {
   return res.status(503).json({
     error: "Model ini dinonaktifkan sementara sampai biaya API aktual dapat diverifikasi. Kredit tidak dipotong."
   });
@@ -474,7 +487,7 @@ if (model === "google/gemini-omni-flash/image-to-video" || model === "minimax/h3
 const isDramaReferenceModel = DRAMA_REFERENCE_MODELS.has(model);
 const isReferenceModel = isWanReferenceModel || isGeminiReferenceModel || isMiniMaxReferenceModel || isDramaReferenceModel;
 const isVideoToVideoModel = isWanVideoToVideoModel || isGeminiEditModel || isMiniMaxReframeModel;
-if (isDramaReferenceModel && !DRAMA_GENERATION_ENABLED) {
+if (isDramaRequest && !DRAMA_GENERATION_ENABLED) {
   return res.status(503).json({
     error: "Generasi Drama AI belum diaktifkan. Pilihan model dan proyek bisa disimpan, tetapi permintaan video belum dikirim dan kredit tidak dipotong."
   });
@@ -551,7 +564,7 @@ const invalidDuration = !isMiniMaxReframeModel && (
   (isSeedanceReferenceModel && (videoDuration < 4 || videoDuration > 30)) ||
   ((isWan30ImageModel || isWan30PrimeImageModel || isWan30ReferenceModel || isWan30PrimeReferenceModel) && ![10, 15, 20, 25, 30].includes(videoDuration)) ||
   (isGeminiReferenceModel && videoDuration !== 10) ||
-  (isReferenceModel && !isMiniMaxReferenceModel && !isDramaReferenceModel && ![5, 10].includes(videoDuration)) ||
+  (isReferenceModel && !isMiniMaxReferenceModel && !isDramaRequest && ![5, 10].includes(videoDuration)) ||
   (isGeminiEditModel && ![5, 10].includes(videoDuration)) ||
   (isWanVideoToVideoModel && ![5, 10].includes(videoDuration)) ||
   (!isVeoModel && !isH3Model && !isGeminiImageModel && !isReferenceModel && !isVideoToVideoModel && (videoDuration < 2 || videoDuration > 30))
@@ -605,17 +618,11 @@ if (
 }
 
 if (
-  (isGeminiReferenceModel || isGeminiEditModel) &&
+  (isGeminiImageModel || isGeminiReferenceModel || isGeminiEditModel) &&
   !["360p", "720p", "1080p"].includes(resolution)
 ) {
   return res.status(400).json({
     error: "Gemini Omni Flash 1.1 mendukung resolusi 360p, 720p, atau 1080p."
-  });
-}
-
-if (isGeminiImageModel && resolution !== "720p") {
-  return res.status(400).json({
-    error: "Gemini Omni Flash Image to Video saat ini memakai resolusi 720p."
   });
 }
 
@@ -670,10 +677,6 @@ falModel = model;
     "720p": {5:65,10:130,15:195},
     "1080p": {5:98,10:195,15:293}
   },
-  "fal-ai/veo3.1/lite/image-to-video": {
-    "720p": {4:26,6:39,8:52},
-    "1080p": {4:42,6:63,8:84}
-  },
   "wan/v2.6/reference-to-video/flash": {
     "720p": {5:65,10:130},
     "1080p": {5:98,10:195}
@@ -693,6 +696,11 @@ falModel = model;
     "768p": {5:52,10:104,15:156},
     "1080p": {5:104,10:208,15:312}
   },
+  "google/gemini-omni-flash/v1.1/image-to-video": {
+    "360p": {5:20,10:39},
+    "720p": {5:65,10:130},
+    "1080p": {5:98,10:195}
+  },
   "google/gemini-omni-flash/v1.1/reference-to-video": {
     "360p": {10:39}, "720p": {10:130}, "1080p": {10:195}
   },
@@ -703,7 +711,7 @@ falModel = model;
   }
 };
 
-let creditAmount = isDramaReferenceModel
+let creditAmount = isDramaRequest
   ? calculateDramaReferenceCredits(model, resolution, videoDuration)
   : creditCosts[model]?.[resolution]?.[videoDuration];
 
@@ -720,9 +728,9 @@ let sourceVideoUrl = null;
 let actualVideoDuration = videoDuration;
  
 if (isReferenceModel) {
-  const maxReferenceImages = isDramaReferenceModel ? 10 : 5;
-  const maxReferenceVideos = isDramaReferenceModel ? 0 : 3;
-  const maxReferenceTotal = isDramaReferenceModel ? 10 : 5;
+  const maxReferenceImages = isDramaRequest ? 10 : 5;
+  const maxReferenceVideos = isDramaRequest ? 0 : 3;
+  const maxReferenceTotal = isDramaRequest ? 10 : 5;
   if (
     !Array.isArray(referenceImages) ||
     !Array.isArray(referenceVideos) ||
@@ -731,7 +739,7 @@ if (isReferenceModel) {
     referenceImages.length + referenceVideos.length > maxReferenceTotal
   ) {
     return res.status(400).json({
-      error: isDramaReferenceModel
+      error: isDramaRequest
         ? "Drama AI menerima maksimal 10 gambar referensi per Scene. Video/audio referensi belum didukung oleh editor Drama AI."
         : "Maksimal 5 referensi total, termasuk maksimal 3 video."
     });
@@ -739,7 +747,7 @@ if (isReferenceModel) {
 
   if (referenceImages.length + referenceVideos.length === 0) {
     return res.status(400).json({
-      error: isDramaReferenceModel
+      error: isDramaRequest
         ? "Pilih minimal satu gambar karakter atau lokasi untuk Scene ini."
         : "Unggah minimal satu gambar atau video referensi."
     });
@@ -903,6 +911,16 @@ if (isReferenceModel) {
       return res.status(400).json({
         error: `Video sumber berdurasi ${sourceDurationSeconds.toFixed(1)} detik, lebih lama dari paket ${videoDuration} detik. Pilih durasi yang mencukupi. Maksimum 10 detik.`
       });
+    }
+    // Gemini Edit has no duration input: it preserves the source clip length.
+    // fal bills per second of output, so estimate/debit against measured source duration.
+    actualVideoDuration = sourceDurationSeconds;
+    const outputRate = ({ "360p": 0.03, "720p": 0.10, "1080p": 0.15 })[resolution];
+    creditAmount = Number.isFinite(outputRate)
+      ? Math.ceil(actualVideoDuration * outputRate * 130)
+      : null;
+    if (!Number.isInteger(creditAmount) || creditAmount < 1) {
+      return res.status(400).json({ error: "Durasi atau biaya Gemini Edit tidak valid." });
     }
   }
   if (isMiniMaxReframeModel) {
@@ -1152,6 +1170,7 @@ const falInput = isSeedanceReferenceModel
       prompt: prompt.trim(),
       image_url: startImageUrl,
       aspect_ratio: ratio,
+      resolution,
       duration: videoDuration
     }
   : isVeoModel
