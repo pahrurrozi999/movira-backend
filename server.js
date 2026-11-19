@@ -1892,7 +1892,7 @@ app.get("/api/credit-orders", async (req, res) => {
     if (authError || !user) return res.status(401).json({ error: "Sesi login tidak valid." });
     const { data, error } = await supabase
       .from("credit_orders")
-      .select("id,credits,amount,currency,status,payment_method,provider,provider_order_id,created_at,paid_at")
+      .select("id,credits,amount,currency,status,payment_method,payment_provider,provider_order_id,created_at,paid_at")
       .eq("user_id", user.id)
       .order("created_at", { ascending: false })
       .limit(30);
