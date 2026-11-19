@@ -325,6 +325,10 @@ function batchIsTerminal(status) {
   return ["succeeded", "failed_confirmed", "not_submitted", "unknown"].includes(status);
 }
 
+// A refund attempt is recoverable after this lease expires. The conditional
+// updated_at compare-and-swap below ensures only one poller claims an attempt.
+const REFUND_RECOVERY_STALE_MS = 2 * 60 * 1000;
+
 async function refreshDramaBatch(batchId, userId) {
   const { data: batch, error: batchError } = await supabase
     .from("drama_generation_batches").select("*").eq("id", batchId).eq("user_id", userId).maybeSingle();
@@ -341,17 +345,35 @@ async function refreshDramaBatch(batchId, userId) {
       const currentStatus = String(status?.status || "").toUpperCase();
       if (currentStatus === "IN_QUEUE" || currentStatus === "IN_PROGRESS") {
         if (scene.status !== "processing") {
-          await supabase.from("drama_generation_batch_scenes").update({ status: "processing", updated_at: new Date().toISOString() }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+          const { error: sceneProgressError } = await supabase
+            .from("drama_generation_batch_scenes")
+            .update({ status: "processing", updated_at: new Date().toISOString() })
+            .eq("id", scene.id).in("status", ["submitted", "processing"]);
+          if (sceneProgressError) throw sceneProgressError;
         }
       } else if (currentStatus === "FAILED") {
-        await supabase.from("drama_generation_batch_scenes").update({
-          status: "failed_confirmed", error_message: String(status?.error || status?.error_type || "fal.ai mengonfirmasi Scene gagal."), updated_at: new Date().toISOString()
-        }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+        const { error: sceneFailedError } = await supabase
+          .from("drama_generation_batch_scenes")
+          .update({
+            status: "failed_confirmed",
+            error_message: String(status?.error || status?.error_type || "fal.ai mengonfirmasi Scene gagal."),
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", scene.id).in("status", ["submitted", "processing"]);
+        if (sceneFailedError) throw sceneFailedError;
       } else if (currentStatus === "COMPLETED") {
         const result = await fal.queue.result(scene.model, { requestId: scene.fal_request_id });
         const videoUrl = result.data?.video?.url || result.data?.video?.video_url || (typeof result.data?.video === "string" ? result.data.video : null);
         if (!videoUrl) {
-          await supabase.from("drama_generation_batch_scenes").update({ status: "unknown", error_message: "fal.ai menyatakan selesai tetapi URL video tidak ditemukan; kredit perlu ditinjau." , updated_at: new Date().toISOString() }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+          const { error: sceneUnknownError } = await supabase
+            .from("drama_generation_batch_scenes")
+            .update({
+              status: "unknown",
+              error_message: "fal.ai menyatakan selesai tetapi URL video tidak ditemukan; kredit perlu ditinjau.",
+              updated_at: new Date().toISOString()
+            })
+            .eq("id", scene.id).in("status", ["submitted", "processing"]);
+          if (sceneUnknownError) throw sceneUnknownError;
           continue;
         }
         const { data: existing, error: existingError } = await supabase
@@ -366,13 +388,21 @@ async function refreshDramaBatch(batchId, userId) {
           });
           if (historyError) console.error("Gagal menyimpan riwayat Drama AI:", historyError);
         }
-        await supabase.from("drama_generation_batch_scenes").update({
-          status: "succeeded", video_url: videoUrl, actual_prompt: result.data?.actual_prompt || null, updated_at: new Date().toISOString()
-        }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+        const { error: sceneSuccessError } = await supabase
+          .from("drama_generation_batch_scenes")
+          .update({
+            status: "succeeded", video_url: videoUrl,
+            actual_prompt: result.data?.actual_prompt || null,
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", scene.id).in("status", ["submitted", "processing"]);
+        if (sceneSuccessError) throw sceneSuccessError;
       }
     } catch (error) {
       // A polling/network/result error is ambiguous. Keep the charge reserved; never auto-refund it.
-      console.error("Drama AI status check failed; charge remains reserved:", { batchId, sceneNumber: scene.scene_number, message: error?.message });
+      console.error("Drama AI status check failed; charge remains reserved:", {
+        batchId, sceneNumber: scene.scene_number, message: error?.message
+      });
     }
   }
 
@@ -381,43 +411,121 @@ async function refreshDramaBatch(batchId, userId) {
   if (latestError) throw latestError;
   const finalScenes = latestScenes || [];
   const allTerminal = finalScenes.length > 0 && finalScenes.every(item => batchIsTerminal(item.status));
-  if (allTerminal && batch.refund_status === "pending") {
+
+  // If fal.ai may have accepted a Scene but its request ID could not be saved,
+  // the Scene cannot be reconciled safely. Retain the charge for manual review.
+  const manualReviewMessages = new Set([
+    "fal.ai menerima antrean tetapi ID antrean gagal disimpan.",
+    "Status pengiriman dan pencatatan Scene tidak dapat dipastikan.",
+    "Status Scene yang belum dikirim gagal disimpan."
+  ]);
+  const requiresManualReview = manualReviewMessages.has(String(batch.error_message || ""));
+
+  const refundStatus = String(batch.refund_status || "");
+  const refundUpdatedAtMs = Date.parse(batch.updated_at || "");
+  const refundStateIsStale = !Number.isFinite(refundUpdatedAtMs)
+    || (Date.now() - refundUpdatedAtMs) >= REFUND_RECOVERY_STALE_MS;
+  const canClaimRefund = refundStatus === "pending"
+    || ((refundStatus === "error" || refundStatus === "processing") && refundStateIsStale);
+
+  if (allTerminal && !requiresManualReview && canClaimRefund) {
     const successAndUnknownUsd = finalScenes
       .filter(item => item.status === "succeeded" || item.status === "unknown")
       .reduce((sum, item) => sum + Number(item.cost_usd || 0), 0);
     const keepCredits = dramaCreditsFromUsd(successAndUnknownUsd);
     const refundCredits = Math.max(0, Number(batch.credit_amount || 0) - keepCredits);
-    const { data: claim, error: claimError } = await supabase
+    const claimAt = new Date().toISOString();
+
+    // Claim with compare-and-swap on both status and updated_at. Concurrent
+    // GET/POST refreshes that read the same version cannot both claim the refund.
+    let claimQuery = supabase
       .from("drama_generation_batches")
-      .update({ refund_status: "processing", refund_amount: refundCredits, updated_at: new Date().toISOString() })
-      .eq("id", batchId).eq("refund_status", "pending").select("id").maybeSingle();
+      .update({
+        refund_status: "processing",
+        refund_amount: refundCredits,
+        updated_at: claimAt
+      })
+      .eq("id", batchId)
+      .eq("refund_status", refundStatus);
+    claimQuery = batch.updated_at
+      ? claimQuery.eq("updated_at", batch.updated_at)
+      : claimQuery.is("updated_at", null);
+
+    const { data: claim, error: claimError } = await claimQuery.select("id").maybeSingle();
     if (claimError) throw claimError;
+
     if (claim) {
       let refundOk = true;
       if (refundCredits > 0) {
         const { data: refundResult, error: refundError } = await supabase.rpc("refund_credit_for_request", {
-          p_user_id: userId, p_amount: refundCredits, p_request_id: batchId
+          p_user_id: userId,
+          p_amount: refundCredits,
+          p_request_id: batchId
         });
+        // The updated SQL RPC returns true both for a new refund and for an
+        // already-recorded refund with the same user, request ID, and amount.
         refundOk = !refundError && refundResult === true;
         if (refundError) console.error("Drama AI confirmed-failure refund error:", refundError);
       }
-      await supabase.from("drama_generation_batches").update({
-        refund_status: refundOk ? "complete" : "error",
-        status: !refundOk ? "unknown" : finalScenes.every(item => item.status === "succeeded") ? "succeeded" : finalScenes.some(item => item.status === "succeeded") ? "partially_succeeded" : finalScenes.some(item => item.status === "unknown") ? "unknown" : "failed_confirmed",
-        updated_at: new Date().toISOString()
-      }).eq("id", batchId);
-      await supabase.from("video_generation_requests").update({
-        status: !refundOk ? "unknown" : finalScenes.some(item => item.status === "succeeded") ? "succeeded" : "failed_confirmed",
-        error_message: !refundOk ? "Pengembalian kredit batch perlu pemeriksaan manual." : null,
-        updated_at: new Date().toISOString()
-      }).eq("credit_request_id", batchId);
+
+      const hasUnknownScene = finalScenes.some(item => item.status === "unknown");
+      const hasSucceededScene = finalScenes.some(item => item.status === "succeeded");
+      const allSucceeded = finalScenes.every(item => item.status === "succeeded");
+      const finalBatchStatus = !refundOk || hasUnknownScene
+        ? "unknown"
+        : allSucceeded
+          ? "succeeded"
+          : hasSucceededScene
+            ? "partially_succeeded"
+            : "failed_confirmed";
+
+      const { error: finalizeBatchError } = await supabase
+        .from("drama_generation_batches")
+        .update({
+          refund_status: refundOk ? "complete" : "error",
+          status: finalBatchStatus,
+          error_message: refundOk
+            ? (hasUnknownScene ? "Ada Scene dengan hasil yang belum dapat dipastikan; kreditnya tetap ditahan." : null)
+            : "Pengembalian kredit batch perlu pemeriksaan ulang.",
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", batchId)
+        .eq("refund_status", "processing")
+        .eq("updated_at", claimAt);
+      if (finalizeBatchError) throw finalizeBatchError;
     }
   }
 
   const { data: finalBatch, error: finalBatchError } = await supabase
     .from("drama_generation_batches").select("*").eq("id", batchId).eq("user_id", userId).single();
   if (finalBatchError) throw finalBatchError;
-  const done = finalScenes.length > 0 && finalScenes.every(item => batchIsTerminal(item.status)) && ["complete", "error"].includes(finalBatch.refund_status);
+
+  // Re-sync the summary request on every refresh after refund finalization.
+  // This repairs a prior partial DB update where the batch was finalized but
+  // video_generation_requests could not be updated.
+  if (allTerminal && ["complete", "error"].includes(finalBatch.refund_status)) {
+    const hasUnknownScene = finalScenes.some(item => item.status === "unknown");
+    const hasSucceededScene = finalScenes.some(item => item.status === "succeeded");
+    const requestNeedsReview = finalBatch.refund_status !== "complete" || hasUnknownScene;
+    const { error: finalizeRequestError } = await supabase
+      .from("video_generation_requests")
+      .update({
+        status: requestNeedsReview ? "unknown" : hasSucceededScene ? "succeeded" : "failed_confirmed",
+        error_message: finalBatch.refund_status !== "complete"
+          ? "Pengembalian kredit batch perlu pemeriksaan ulang."
+          : hasUnknownScene
+            ? "Ada Scene dengan hasil yang belum dapat dipastikan; kreditnya tetap ditahan."
+            : null,
+        updated_at: new Date().toISOString()
+      })
+      .eq("credit_request_id", batchId);
+    if (finalizeRequestError) throw finalizeRequestError;
+  }
+
+  const done = allTerminal && (
+    finalBatch.refund_status === "complete"
+    || (finalBatch.refund_status === "error" && requiresManualReview)
+  );
   return { batch: finalBatch, scenes: finalScenes, done };
 }
 
