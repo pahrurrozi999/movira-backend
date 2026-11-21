@@ -220,14 +220,21 @@ const allowedRatios = new Set([
   "9:16"
 ]);
 
-const allowedResolutions = new Set([
-  "360p",
-  "480p",
-  "580p",
-  "720p",
-  "768p",
-  "1080p"
-]);
+const MODEL_RESOLUTION_OPTIONS = Object.freeze({
+  "alibaba/wan-3.0/image-to-video": ["480p", "720p", "1080p"],
+  "alibaba/wan-3.0-prime/image-to-video": ["480p", "720p", "1080p"],
+  "wan/v2.6/image-to-video": ["720p", "1080p"],
+  "fal-ai/veo3.1/lite/image-to-video": ["720p", "1080p"],
+  "minimax/h3-max-turbo/image-to-video": ["480p", "768p", "1080p"],
+  "google/gemini-omni-flash/v1.1/image-to-video": ["360p", "720p", "1080p"],
+  "wan/v2.6/reference-to-video/flash": ["720p", "1080p"],
+  "google/gemini-omni-flash/v1.1/reference-to-video": ["360p", "720p", "1080p"],
+  "minimax/h3-max/reference-to-video": ["480p", "768p", "1080p"],
+  "fal-ai/wan/v2.2-a14b/video-to-video": ["480p", "580p", "720p"],
+  "google/gemini-omni-flash/v1.1/edit": ["360p", "720p", "1080p"],
+  // Tetap tidak aktif sampai biaya Reframe terverifikasi.
+  "minimax/h3-max/reframe-video": ["480p", "768p"]
+});
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -1329,6 +1336,15 @@ if (!ALLOWED_MODELS.has(model)) {
   });
 }
 
+const supportedModelResolutions = isDramaRequest
+  ? DRAMA_BATCH_MODELS[model]?.resolutions
+  : MODEL_RESOLUTION_OPTIONS[model];
+if (!Array.isArray(supportedModelResolutions) || !supportedModelResolutions.includes(resolution)) {
+  return res.status(400).json({
+    error: "Resolusi tidak didukung oleh model yang dipilih. Pilih salah satu resolusi yang tersedia pada tampilan Movira."
+  });
+}
+
 falModel = model;
 
  const creditCosts = {
@@ -1345,6 +1361,10 @@ falModel = model;
   "wan/v2.6/image-to-video": {
     "720p": {5:65,10:130,15:195},
     "1080p": {5:98,10:195,15:293}
+  },
+  "fal-ai/veo3.1/lite/image-to-video": {
+    "720p": {4:26,6:39,8:52},
+    "1080p": {4:42,6:63,8:84}
   },
   "wan/v2.6/reference-to-video/flash": {
     "720p": {5:65,10:130},
@@ -1731,7 +1751,7 @@ const falInput = isSeedanceReferenceModel
       prompt: prompt.trim(),
       image_url: startImageUrl,
       resolution,
-      aspect_ratio: ratio,
+      aspect_ratio: "auto",
       duration: `${videoDuration}s`,
       generate_audio: Boolean(audio)
     }
