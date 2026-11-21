@@ -130,6 +130,28 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: "15mb" }));
+const mediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024, files: 1 }
+});
+const uploadedMediaTickets = new Map();
+const UPLOAD_TICKET_TTL_MS = 30 * 60 * 1000;
+
+function pruneUploadedMediaTickets() {
+  const now = Date.now();
+  for (const [id, ticket] of uploadedMediaTickets) {
+    if (now - ticket.createdAt > UPLOAD_TICKET_TTL_MS) uploadedMediaTickets.delete(id);
+  }
+}
+
+function resolveUploadedMediaTicket(id, userId, kind) {
+  if (typeof id !== "string" || !id) return null;
+  pruneUploadedMediaTickets();
+  const ticket = uploadedMediaTickets.get(id);
+  if (!ticket || ticket.userId !== userId || (kind && ticket.kind !== kind)) return null;
+  return ticket;
+}
+
 const DEMO_MODE = process.env.DEMO_MODE === "true";
 const PAYMENT_SIMULATION_ENABLED = process.env.PAYMENT_SIMULATION_MODE === "true";
 const CREDIT_ORDER_PRICES = {
@@ -195,8 +217,7 @@ const ALLOWED_MODELS = new Set([
 
 const allowedRatios = new Set([
   "16:9",
-  "9:16",
-  "1:1"
+  "9:16"
 ]);
 
 const allowedResolutions = new Set([
@@ -341,17 +362,20 @@ async function refreshDramaBatch(batchId, userId) {
       const currentStatus = String(status?.status || "").toUpperCase();
       if (currentStatus === "IN_QUEUE" || currentStatus === "IN_PROGRESS") {
         if (scene.status !== "processing") {
-          await supabase.from("drama_generation_batch_scenes").update({ status: "processing", updated_at: new Date().toISOString() }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+          const { error: processingUpdateError } = await supabase.from("drama_generation_batch_scenes").update({ status: "processing", updated_at: new Date().toISOString() }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+          if (processingUpdateError) throw processingUpdateError;
         }
       } else if (currentStatus === "FAILED") {
-        await supabase.from("drama_generation_batch_scenes").update({
+        const { error: failedUpdateError } = await supabase.from("drama_generation_batch_scenes").update({
           status: "failed_confirmed", error_message: String(status?.error || status?.error_type || "fal.ai mengonfirmasi Scene gagal."), updated_at: new Date().toISOString()
         }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+        if (failedUpdateError) throw failedUpdateError;
       } else if (currentStatus === "COMPLETED") {
         const result = await fal.queue.result(scene.model, { requestId: scene.fal_request_id });
         const videoUrl = result.data?.video?.url || result.data?.video?.video_url || (typeof result.data?.video === "string" ? result.data.video : null);
         if (!videoUrl) {
-          await supabase.from("drama_generation_batch_scenes").update({ status: "unknown", error_message: "fal.ai menyatakan selesai tetapi URL video tidak ditemukan; kredit perlu ditinjau." , updated_at: new Date().toISOString() }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+          const { error: missingUrlUpdateError } = await supabase.from("drama_generation_batch_scenes").update({ status: "unknown", error_message: "fal.ai menyatakan selesai tetapi URL video tidak ditemukan; kredit perlu ditinjau." , updated_at: new Date().toISOString() }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+          if (missingUrlUpdateError) throw missingUrlUpdateError;
           continue;
         }
         const { data: existing, error: existingError } = await supabase
@@ -364,11 +388,15 @@ async function refreshDramaBatch(batchId, userId) {
             ratio: scene.ratio, duration: scene.duration, resolution: scene.resolution,
             project_id: batch.project_id, scene_number: scene.scene_number
           });
-          if (historyError) console.error("Gagal menyimpan riwayat Drama AI:", historyError);
+          if (historyError) {
+            console.error("Gagal menyimpan riwayat Drama AI; Scene akan dicoba lagi saat pemeriksaan status berikutnya:", historyError);
+            throw historyError;
+          }
         }
-        await supabase.from("drama_generation_batch_scenes").update({
+        const { error: succeededUpdateError } = await supabase.from("drama_generation_batch_scenes").update({
           status: "succeeded", video_url: videoUrl, actual_prompt: result.data?.actual_prompt || null, updated_at: new Date().toISOString()
         }).eq("id", scene.id).in("status", ["submitted", "processing"]);
+        if (succeededUpdateError) throw succeededUpdateError;
       }
     } catch (error) {
       // A polling/network/result error is ambiguous. Keep the charge reserved; never auto-refund it.
@@ -418,22 +446,25 @@ async function refreshDramaBatch(batchId, userId) {
       if (retryableRefundError) {
         // Keep processing and refresh updated_at; a later poll retries the same
         // idempotent RPC instead of permanently stranding the batch in error.
-        await supabase.from("drama_generation_batches").update({
+        const { error: retryStateError } = await supabase.from("drama_generation_batches").update({
           refund_status: "processing", error_message: "Refund sementara gagal; sistem akan mencoba kembali.",
           updated_at: new Date().toISOString()
         }).eq("id", batchId).eq("refund_status", "processing");
+        if (retryStateError) throw retryStateError;
       } else {
-        await supabase.from("drama_generation_batches").update({
+        const { error: requestFinalUpdateError } = await supabase.from("video_generation_requests").update({
+          status: !refundOk ? "unknown" : finalScenes.some(item => item.status === "succeeded") ? "succeeded" : "failed_confirmed",
+          error_message: !refundOk ? "Pengembalian kredit batch perlu pemeriksaan manual." : null,
+          updated_at: new Date().toISOString()
+        }).eq("credit_request_id", batchId);
+        if (requestFinalUpdateError) throw requestFinalUpdateError;
+        const { error: batchFinalUpdateError } = await supabase.from("drama_generation_batches").update({
           refund_status: refundOk ? "complete" : "error",
           status: !refundOk ? "unknown" : finalScenes.every(item => item.status === "succeeded") ? "succeeded" : finalScenes.some(item => item.status === "succeeded") ? "partially_succeeded" : finalScenes.some(item => item.status === "unknown") ? "unknown" : "failed_confirmed",
           error_message: !refundOk ? "Refund ditolak oleh fungsi SQL; periksa debit dan jumlah refund." : null,
           updated_at: new Date().toISOString()
         }).eq("id", batchId).eq("refund_status", "processing");
-        await supabase.from("video_generation_requests").update({
-          status: !refundOk ? "unknown" : finalScenes.some(item => item.status === "succeeded") ? "succeeded" : "failed_confirmed",
-          error_message: !refundOk ? "Pengembalian kredit batch perlu pemeriksaan manual." : null,
-          updated_at: new Date().toISOString()
-        }).eq("credit_request_id", batchId);
+        if (batchFinalUpdateError) throw batchFinalUpdateError;
       }
     }
   }
@@ -549,7 +580,8 @@ app.post("/api/drama-generate-batch", dramaBatchLimiter, async (req, res) => {
     }));
     const { error: sceneInsertError } = await supabase.from("drama_generation_batch_scenes").insert(sceneRows);
     if (sceneInsertError) {
-      await supabase.from("drama_generation_batches").update({ status: "failed_confirmed", refund_status: "complete", error_message: "Gagal menyiapkan daftar Scene sebelum pemotongan kredit." }).eq("id", batchId);
+      const { error: batchSetupUpdateError } = await supabase.from("drama_generation_batches").update({ status: "failed_confirmed", refund_status: "complete", error_message: "Gagal menyiapkan daftar Scene sebelum pemotongan kredit." }).eq("id", batchId);
+      if (batchSetupUpdateError) console.error("Gagal mencatat kegagalan persiapan Scene:", batchSetupUpdateError);
       throw sceneInsertError;
     }
 
@@ -558,7 +590,8 @@ app.post("/api/drama-generate-batch", dramaBatchLimiter, async (req, res) => {
       status: "submitted", credit_amount: totalCredits, project_id: null, scene_number: null
     });
     if (requestInsertError) {
-      await supabase.from("drama_generation_batches").update({ status: "failed_confirmed", refund_status: "complete", error_message: "Gagal mencatat permintaan sebelum debit kredit." }).eq("id", batchId);
+      const { error: batchRequestUpdateError } = await supabase.from("drama_generation_batches").update({ status: "failed_confirmed", refund_status: "complete", error_message: "Gagal mencatat permintaan sebelum debit kredit." }).eq("id", batchId);
+      if (batchRequestUpdateError) console.error("Gagal mencatat status batch sebelum debit:", batchRequestUpdateError);
       return res.status(500).json({ error: "Gagal mencatat permintaan batch. Kredit belum dipotong.", batch_id: batchId });
     }
     const { data: consumed, error: consumeError } = await supabase.rpc("consume_credit_for_request", {
@@ -566,13 +599,17 @@ app.post("/api/drama-generate-batch", dramaBatchLimiter, async (req, res) => {
     });
     if (consumeError) {
       batchCreditsConsumed = true; // The RPC result is ambiguous; do not auto-refund.
-      await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "Status debit kredit perlu diperiksa." }).eq("id", batchId);
-      await supabase.from("video_generation_requests").update({ status: "unknown", error_message: "Status debit kredit perlu diperiksa." }).eq("credit_request_id", batchId);
+      const { error: batchDebitStatusError } = await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "Status debit kredit perlu diperiksa." }).eq("id", batchId);
+      const { error: requestDebitStatusError } = await supabase.from("video_generation_requests").update({ status: "unknown", error_message: "Status debit kredit perlu diperiksa." }).eq("credit_request_id", batchId);
+      if (batchDebitStatusError) console.error("Gagal mencatat status debit batch:", batchDebitStatusError);
+      if (requestDebitStatusError) console.error("Gagal mencatat status debit request:", requestDebitStatusError);
       return res.status(500).json({ error: "Status pemotongan kredit belum dapat dipastikan. Jangan ulangi Generate; periksa riwayat kredit terlebih dahulu.", batch_id: batchId });
     }
     if (!consumed) {
-      await supabase.from("drama_generation_batches").update({ status: "failed_confirmed", refund_status: "complete", error_message: "Kredit tidak cukup." }).eq("id", batchId);
-      await supabase.from("video_generation_requests").update({ status: "failed_confirmed", error_message: "Kredit tidak cukup." }).eq("credit_request_id", batchId);
+      const { error: batchInsufficientStatusError } = await supabase.from("drama_generation_batches").update({ status: "failed_confirmed", refund_status: "complete", error_message: "Kredit tidak cukup." }).eq("id", batchId);
+      const { error: requestInsufficientStatusError } = await supabase.from("video_generation_requests").update({ status: "failed_confirmed", error_message: "Kredit tidak cukup." }).eq("credit_request_id", batchId);
+      if (batchInsufficientStatusError) console.error("Gagal mencatat kredit tidak cukup pada batch:", batchInsufficientStatusError);
+      if (requestInsufficientStatusError) console.error("Gagal mencatat kredit tidak cukup pada request:", requestInsufficientStatusError);
       return res.status(402).json({ error: "Kredit tidak cukup.", batch_id: batchId });
     }
     batchCreditsConsumed = true;
@@ -583,7 +620,10 @@ app.post("/api/drama-generate-batch", dramaBatchLimiter, async (req, res) => {
       if (submitStopped) {
         const { error: notSubmittedError } = await supabase.from("drama_generation_batch_scenes").update({ status: "not_submitted", error_message: "Tidak dikirim karena pengiriman Scene sebelumnya mengalami status tidak pasti." }).eq("id", row.id);
         if (notSubmittedError) {
-          await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "Status Scene yang belum dikirim gagal disimpan." }).eq("id", batchId);
+          const { error: batchStatusError } = await supabase.from("drama_generation_batches")
+            .update({ status: "unknown", refund_status: "error", error_message: "Status Scene yang belum dikirim gagal disimpan." })
+            .eq("id", batchId);
+          if (batchStatusError) console.error("Gagal mencatat batch saat Scene yang belum dikirim tidak tersimpan:", batchStatusError);
           return res.status(500).json({ error: "Status batch tidak dapat dipastikan. Jangan ulangi Generate; periksa kredit.", batch_id: batchId });
         }
         continue;
@@ -594,21 +634,25 @@ app.post("/api/drama-generate-batch", dramaBatchLimiter, async (req, res) => {
         if (!requestId) throw new Error("fal.ai tidak mengembalikan request ID.");
         const { error: queueSaveError } = await supabase.from("drama_generation_batch_scenes").update({ status: "submitted", fal_request_id: requestId, updated_at: new Date().toISOString() }).eq("id", row.id);
         if (queueSaveError) {
-          await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "fal.ai menerima antrean tetapi ID antrean gagal disimpan." }).eq("id", batchId);
+          const { error: queueBatchUpdateError } = await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "fal.ai menerima antrean tetapi ID antrean gagal disimpan." }).eq("id", batchId);
+          if (queueBatchUpdateError) console.error("Gagal mencatat batch saat ID antrean tidak tersimpan:", queueBatchUpdateError);
           return res.status(500).json({ error: "fal.ai menerima permintaan, tetapi pencatatan antrean gagal. Jangan Generate ulang; status kredit perlu diperiksa.", batch_id: batchId });
         }
       } catch (submitError) {
         // No request ID means acceptance cannot be proven; retain that Scene's charge.
         const { error: unknownSaveError } = await supabase.from("drama_generation_batch_scenes").update({ status: "unknown", error_message: String(submitError?.message || "Status pengiriman tidak dapat dipastikan."), updated_at: new Date().toISOString() }).eq("id", row.id);
         if (unknownSaveError) {
-          await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "Status pengiriman dan pencatatan Scene tidak dapat dipastikan." }).eq("id", batchId);
+          const { error: unknownBatchUpdateError } = await supabase.from("drama_generation_batches").update({ status: "unknown", refund_status: "error", error_message: "Status pengiriman dan pencatatan Scene tidak dapat dipastikan." }).eq("id", batchId);
+          if (unknownBatchUpdateError) console.error("Gagal mencatat batch dengan status pengiriman tidak pasti:", unknownBatchUpdateError);
           return res.status(500).json({ error: "Status pengiriman tidak dapat dipastikan. Jangan ulangi Generate; periksa kredit.", batch_id: batchId });
         }
         submitStopped = true;
       }
     }
-    await supabase.from("drama_generation_batches").update({ status: "processing", updated_at: new Date().toISOString() }).eq("id", batchId);
-    await supabase.from("video_generation_requests").update({ status: "processing" }).eq("credit_request_id", batchId);
+    const { error: batchProcessingError } = await supabase.from("drama_generation_batches").update({ status: "processing", updated_at: new Date().toISOString() }).eq("id", batchId);
+    if (batchProcessingError) throw batchProcessingError;
+    const { error: requestProcessingError } = await supabase.from("video_generation_requests").update({ status: "processing" }).eq("credit_request_id", batchId);
+    if (requestProcessingError) throw requestProcessingError;
     const initial = await refreshDramaBatch(batchId, user.id);
     return res.status(202).json({ ok: true, batch_id: batchId, credit_amount: totalCredits, scene_count: prepared.length, batch: initial?.batch, scenes: initial?.scenes, done: initial?.done || false });
   } catch (error) {
@@ -619,11 +663,12 @@ app.post("/api/drama-generate-batch", dramaBatchLimiter, async (req, res) => {
         .select("id").eq("id", batchId).eq("user_id", userId).maybeSingle();
       if (!lookupError && persistedBatch) {
         persistedBatchId = persistedBatch.id;
-        await supabase.from("drama_generation_batches").update({
+        const { error: finalErrorUpdate } = await supabase.from("drama_generation_batches").update({
           status: batchCreditsConsumed ? "unknown" : "failed_confirmed",
           refund_status: batchCreditsConsumed ? "error" : "complete",
           error_message: String(error?.message || "Kesalahan batch tidak diketahui")
         }).eq("id", batchId);
+        if (finalErrorUpdate) console.error("Gagal mencatat status akhir kegagalan batch:", finalErrorUpdate);
       }
     }
     return res.status(500).json({ error: "Gagal menyiapkan batch Drama AI. Periksa status proyek dan kredit sebelum mencoba lagi.", ...(persistedBatchId ? { batch_id: persistedBatchId } : {}) });
@@ -818,6 +863,208 @@ console.log("HASIL KREDIT:", {
     });
   }
 });
+const mediaUploadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "Terlalu banyak unggahan. Coba lagi sebentar." }
+});
+
+let activeMediaUploads = 0;
+const MAX_CONCURRENT_MEDIA_UPLOADS = 1;
+
+function releaseMediaUploadSlot(req) {
+  if (req.mediaUploadSlotHeld) {
+    req.mediaUploadSlotHeld = false;
+    activeMediaUploads = Math.max(0, activeMediaUploads - 1);
+  }
+}
+
+async function authorizeMediaUpload(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const accessToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!accessToken) return res.status(401).json({ error: "Silakan login terlebih dahulu." });
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken);
+    if (error || !user) return res.status(401).json({ error: "Sesi login tidak valid." });
+    if (DEMO_MODE) return res.status(503).json({ error: "Mode demo masih aktif. Unggahan media dinonaktifkan dan tidak ada permintaan fal.ai yang dibuat." });
+    if (activeMediaUploads >= MAX_CONCURRENT_MEDIA_UPLOADS) {
+      return res.status(429).json({ error: "Sedang ada unggahan lain. Tunggu hingga selesai, lalu coba lagi." });
+    }
+    activeMediaUploads += 1;
+    req.mediaUploadSlotHeld = true;
+    req.mediaUploadUser = user;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+function parseSingleMediaUpload(req, res, next) {
+  mediaUpload.single("file")(req, res, error => {
+    if (error) {
+      releaseMediaUploadSlot(req);
+      return next(error);
+    }
+    return next();
+  });
+}
+
+app.post("/api/upload-media", mediaUploadLimiter, authorizeMediaUpload, parseSingleMediaUpload, async (req, res) => {
+  try {
+    const user = req.mediaUploadUser;
+    const file = req.file;
+    if (!file || !Buffer.isBuffer(file.buffer) || file.buffer.length === 0) {
+      return res.status(400).json({ error: "Pilih file yang akan diunggah." });
+    }
+
+    const imageTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/bmp"]);
+    const videoTypes = new Set(["video/mp4", "video/quicktime"]);
+    const isImage = imageTypes.has(file.mimetype);
+    const isVideo = videoTypes.has(file.mimetype);
+    if (!isImage && !isVideo) return res.status(415).json({ error: "Format file harus JPG, PNG, WEBP, BMP, MP4, atau MOV." });
+    const maxBytes = isImage ? 10 * 1024 * 1024 : 100 * 1024 * 1024;
+    if (file.buffer.length > maxBytes) {
+      return res.status(413).json({ error: isImage ? "Ukuran gambar maksimal 10 MB." : "Ukuran video maksimal 100 MB." });
+    }
+
+    let dimensions = null;
+    let durationSeconds = null;
+    if (isImage) {
+      dimensions = readImageDimensions(file.buffer, file.mimetype);
+      if (!dimensions || dimensions.width < 1 || dimensions.height < 1) {
+        return res.status(400).json({ error: "Dimensi gambar tidak dapat dibaca. Ekspor ulang gambar sebagai JPG, PNG, atau WEBP." });
+      }
+    } else {
+      durationSeconds = readMp4DurationSeconds(file.buffer);
+    }
+
+    const extensions = {
+      "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/bmp": "bmp",
+      "video/mp4": "mp4", "video/quicktime": "mov"
+    };
+    const uploadFile = new File([file.buffer], `movira-upload-${randomUUID()}.${extensions[file.mimetype]}`, { type: file.mimetype });
+    const url = await fal.storage.upload(uploadFile);
+    const uploadId = randomUUID();
+    pruneUploadedMediaTickets();
+    uploadedMediaTickets.set(uploadId, {
+      userId: user.id,
+      url,
+      mimeType: file.mimetype,
+      kind: isImage ? "image" : "video",
+      sizeBytes: file.buffer.length,
+      width: dimensions?.width || null,
+      height: dimensions?.height || null,
+      durationSeconds,
+      createdAt: Date.now()
+    });
+
+    return res.json({
+      ok: true,
+      upload_id: uploadId,
+      mime_type: file.mimetype,
+      size_bytes: file.buffer.length,
+      width: dimensions?.width || null,
+      height: dimensions?.height || null,
+      duration_seconds: durationSeconds
+    });
+  } catch (error) {
+    console.error("Media upload error:", error);
+    return res.status(500).json({ error: "Gagal mengunggah media ke penyimpanan video." });
+  } finally {
+    releaseMediaUploadSlot(req);
+  }
+});
+
+const generateQuoteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "Terlalu banyak permintaan estimasi biaya. Coba lagi sebentar." }
+});
+
+app.post("/api/generate/quote", generateQuoteLimiter, async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    const accessToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!accessToken) return res.status(401).json({ error: "Silakan login terlebih dahulu." });
+    const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) return res.status(401).json({ error: "Sesi login tidak valid." });
+    if (DEMO_MODE) return res.status(503).json({ error: "Mode demo masih aktif. Estimasi berbasis unggahan belum tersedia." });
+
+    const { model, resolution, duration, referenceImageUploadIds = [], referenceVideoUploadIds = [] } = req.body || {};
+    if (model !== "minimax/h3-max/reference-to-video") {
+      return res.status(400).json({ error: "Estimasi khusus MiniMax H3 Max Reference-to-Video." });
+    }
+    const seconds = Number(duration);
+    const outputRates = { "480p": 0.05, "768p": 0.08, "1080p": 0.16 };
+    const tokensPerSecond = resolution === "480p" ? 2886 : 7459;
+    const outputRate = outputRates[resolution];
+    if (!Number.isFinite(outputRate) || ![5, 10, 15].includes(seconds)) {
+      return res.status(400).json({ error: "Kombinasi resolusi dan durasi MiniMax tidak valid." });
+    }
+    if (!Array.isArray(referenceImageUploadIds) || !Array.isArray(referenceVideoUploadIds)) {
+      return res.status(400).json({ error: "Daftar referensi tidak valid." });
+    }
+    if (referenceImageUploadIds.length > 5 || referenceVideoUploadIds.length > 3 || referenceImageUploadIds.length + referenceVideoUploadIds.length > 5) {
+      return res.status(400).json({ error: "Pilih 1–5 file referensi, dengan maksimal 3 video." });
+    }
+    const imageTickets = referenceImageUploadIds.map(id => resolveUploadedMediaTicket(id, user.id, "image"));
+    const videoTickets = referenceVideoUploadIds.map(id => resolveUploadedMediaTicket(id, user.id, "video"));
+    if (imageTickets.some(ticket => !ticket) || videoTickets.some(ticket => !ticket)) {
+      return res.status(400).json({ error: "Salah satu referensi kedaluwarsa atau bukan milik akun ini. Unggah ulang file." });
+    }
+    if (imageTickets.length + videoTickets.length < 1 || imageTickets.length + videoTickets.length > 5 || videoTickets.length > 3) {
+      return res.status(400).json({ error: "Pilih 1–5 file referensi, dengan maksimal 3 video." });
+    }
+
+    let referenceTokens = 0;
+    let totalReferenceVideoSeconds = 0;
+    for (const ticket of imageTickets) {
+      if (!ticket.width || !ticket.height) return res.status(400).json({ error: "Dimensi gambar referensi tidak tersedia. Unggah ulang gambar." });
+      referenceTokens += Math.ceil((ticket.width * ticket.height) / 1024);
+    }
+    for (const ticket of videoTickets) {
+      const videoSeconds = Number(ticket.durationSeconds);
+      if (!Number.isFinite(videoSeconds) || videoSeconds < 2 || videoSeconds > 15) {
+        return res.status(400).json({ error: "Setiap video referensi MiniMax harus berdurasi 2–15 detik dan dapat dibaca." });
+      }
+      totalReferenceVideoSeconds += videoSeconds;
+      referenceTokens += Math.ceil(videoSeconds * tokensPerSecond);
+    }
+    if (totalReferenceVideoSeconds > 15) {
+      return res.status(400).json({ error: "Total durasi video referensi MiniMax maksimal 15 detik." });
+    }
+
+    const extraTokens = Math.max(0, referenceTokens - 4096);
+    const baseCostUsd = outputRate * seconds;
+    const referenceCostUsd = (extraTokens / 1000) * 0.02;
+    const totalCostUsd = baseCostUsd + referenceCostUsd;
+    const baseCredits = Math.ceil(baseCostUsd * 130);
+    const totalCredits = Math.ceil(totalCostUsd * 130);
+    return res.json({
+      ok: true,
+      model,
+      resolution,
+      duration: seconds,
+      image_count: imageTickets.length,
+      video_count: videoTickets.length,
+      reference_tokens: referenceTokens,
+      base_cost_usd: baseCostUsd,
+      reference_cost_usd: referenceCostUsd,
+      total_cost_usd: totalCostUsd,
+      base_credits: baseCredits,
+      additional_reference_credits: Math.max(0, totalCredits - baseCredits),
+      total_credits: totalCredits
+    });
+  } catch (error) {
+    console.error("Generation quote error:", error);
+    return res.status(500).json({ error: "Gagal menghitung biaya akhir referensi." });
+  }
+});
+
 app.post("/api/generate", generateLimiter, async (req, res) => {
 let creditWasConsumed = false;
 let creditUserId = null;
@@ -825,6 +1072,7 @@ let creditRequestId = null;
 let creditAmountToRefund = null;
 let falRequestId = null;
 let falModel = null;
+let falRequestPersistPromise = Promise.resolve();
 let recoveryData = null;
 try {
    const authHeader = req.headers.authorization || "";
@@ -872,9 +1120,13 @@ const {
   resolution = "720p",
   imageUrl,
   imageData,
+  imageUploadId = null,
   referenceImages = [],
   referenceVideos = [],
+  referenceImageUploadIds = [],
+  referenceVideoUploadIds = [],
   sourceVideo = null,
+  sourceVideoUploadId = null,
   audio = true,
   model = DEFAULT_MODEL,
   project_id: projectId = null,
@@ -1019,21 +1271,9 @@ if (invalidDuration) {
   });
 }
 
-if (
-  (isVeoModel || isGeminiImageModel || (isReferenceModel && !isMiniMaxReferenceModel)) &&
-  !["16:9", "9:16"].includes(ratio)
-) {
+if (!allowedRatios.has(ratio)) {
   return res.status(400).json({
-    error: "Model ini hanya mendukung rasio 16:9 atau 9:16."
-  });
-}
-
-if (
-  isVideoToVideoModel &&
-  !["16:9", "9:16", "1:1"].includes(ratio)
-) {
-  return res.status(400).json({
-    error: "Video to Video mendukung rasio 16:9, 9:16, atau 1:1."
+    error: "Movira hanya menerima rasio 16:9 atau 9:16. Model dengan rasio otomatis akan mengikuti media sumber."
   });
 }
  
@@ -1150,7 +1390,9 @@ if (!creditAmount) {
   });
 }
  
-   let startImageUrl = imageUrl;
+   const mainImageTicket = imageUploadId ? resolveUploadedMediaTicket(imageUploadId, user.id, "image") : null;
+   if (imageUploadId && !mainImageTicket) return res.status(400).json({ error: "Unggahan gambar utama kedaluwarsa atau bukan milik akun ini. Unggah ulang gambar." });
+   let startImageUrl = mainImageTicket?.url || imageUrl;
 let referenceImageUrls = [];
 let referenceVideoUrls = [];
 let sourceVideoUrl = null;
@@ -1160,13 +1402,19 @@ if (isReferenceModel) {
   const maxReferenceImages = isDramaRequest ? 10 : 5;
   const maxReferenceVideos = isDramaRequest ? 0 : 3;
   const maxReferenceTotal = isDramaRequest ? 10 : 5;
-  if (
-    !Array.isArray(referenceImages) ||
-    !Array.isArray(referenceVideos) ||
-    referenceImages.length > maxReferenceImages ||
-    referenceVideos.length > maxReferenceVideos ||
-    referenceImages.length + referenceVideos.length > maxReferenceTotal
-  ) {
+  if (!Array.isArray(referenceImages) || !Array.isArray(referenceVideos) ||
+      !Array.isArray(referenceImageUploadIds) || !Array.isArray(referenceVideoUploadIds)) {
+    return res.status(400).json({ error: "Daftar file referensi tidak valid." });
+  }
+
+  const referenceImageTickets = referenceImageUploadIds.map(id => resolveUploadedMediaTicket(id, user.id, "image"));
+  const referenceVideoTickets = referenceVideoUploadIds.map(id => resolveUploadedMediaTicket(id, user.id, "video"));
+  if (referenceImageTickets.some(ticket => !ticket) || referenceVideoTickets.some(ticket => !ticket)) {
+    return res.status(400).json({ error: "Salah satu unggahan referensi kedaluwarsa atau bukan milik akun ini. Unggah ulang file referensi." });
+  }
+  const imageCount = referenceImages.length + referenceImageTickets.length;
+  const videoCount = referenceVideos.length + referenceVideoTickets.length;
+  if (imageCount > maxReferenceImages || videoCount > maxReferenceVideos || imageCount + videoCount > maxReferenceTotal) {
     return res.status(400).json({
       error: isDramaRequest
         ? "Drama AI menerima maksimal 10 gambar referensi per Scene. Video/audio referensi belum didukung oleh editor Drama AI."
@@ -1174,7 +1422,7 @@ if (isReferenceModel) {
     });
   }
 
-  if (referenceImages.length + referenceVideos.length === 0) {
+  if (imageCount + videoCount === 0) {
     return res.status(400).json({
       error: isDramaRequest
         ? "Pilih minimal satu gambar karakter atau lokasi untuk Scene ini."
@@ -1186,250 +1434,127 @@ if (isReferenceModel) {
     let referenceTokens = 0;
     let totalReferenceVideoSeconds = 0;
 
+    for (const ticket of referenceImageTickets) {
+      if (!ticket.width || !ticket.height) return res.status(400).json({ error: "Dimensi salah satu gambar referensi MiniMax tidak tersedia. Unggah ulang gambar." });
+      referenceTokens += Math.ceil((ticket.width * ticket.height) / 1024);
+    }
     for (const dataUrl of referenceImages) {
-      if (typeof dataUrl !== "string") {
-        return res.status(400).json({ error: "Data gambar referensi MiniMax tidak valid." });
-      }
+      if (typeof dataUrl !== "string") return res.status(400).json({ error: "Data gambar referensi MiniMax tidak valid." });
       const match = dataUrl.match(/^data:(image\/(?:jpeg|png|webp|bmp));base64,(.+)$/i);
-      if (!match) {
-        return res.status(400).json({ error: "Format gambar referensi MiniMax tidak didukung." });
-      }
+      if (!match) return res.status(400).json({ error: "Format gambar referensi MiniMax tidak didukung." });
       const imageBuffer = Buffer.from(match[2], "base64");
-      if (imageBuffer.length === 0 || imageBuffer.length > 10 * 1024 * 1024) {
-        return res.status(400).json({ error: "Ukuran setiap gambar referensi maksimal 10 MB." });
-      }
+      if (imageBuffer.length === 0 || imageBuffer.length > 10 * 1024 * 1024) return res.status(400).json({ error: "Ukuran setiap gambar referensi maksimal 10 MB." });
       const dimensions = readImageDimensions(imageBuffer, match[1].toLowerCase());
-      if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) {
-        return res.status(400).json({
-          error: "Ukuran gambar referensi MiniMax tidak dapat dibaca. Ekspor ulang sebagai JPG, PNG, atau WEBP lalu coba lagi."
-        });
-      }
+      if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) return res.status(400).json({ error: "Ukuran gambar referensi MiniMax tidak dapat dibaca. Ekspor ulang sebagai JPG, PNG, atau WEBP lalu coba lagi." });
       referenceTokens += Math.ceil((dimensions.width * dimensions.height) / 1024);
     }
 
+    for (const ticket of referenceVideoTickets) {
+      const seconds = Number(ticket.durationSeconds);
+      if (!Number.isFinite(seconds) || seconds < 2 || seconds > 15) return res.status(400).json({ error: "Setiap video referensi MiniMax harus berdurasi 2–15 detik dan dapat dibaca." });
+      totalReferenceVideoSeconds += seconds;
+      const tokensPerSecond = resolution === "480p" ? 2886 : 7459;
+      referenceTokens += Math.ceil(seconds * tokensPerSecond);
+    }
     for (const dataUrl of referenceVideos) {
-      if (typeof dataUrl !== "string") {
-        return res.status(400).json({ error: "Data video referensi MiniMax tidak valid." });
-      }
+      if (typeof dataUrl !== "string") return res.status(400).json({ error: "Data video referensi MiniMax tidak valid." });
       const match = dataUrl.match(/^data:video\/(?:mp4|quicktime);base64,(.+)$/i);
-      if (!match) {
-        return res.status(400).json({ error: "Format video referensi MiniMax tidak didukung." });
-      }
+      if (!match) return res.status(400).json({ error: "Format video referensi MiniMax tidak didukung." });
       const videoBuffer = Buffer.from(match[1], "base64");
-      if (videoBuffer.length === 0 || videoBuffer.length > 100 * 1024 * 1024) {
-        return res.status(400).json({ error: "Ukuran setiap video referensi maksimal 100 MB." });
-      }
+      if (videoBuffer.length === 0 || videoBuffer.length > 100 * 1024 * 1024) return res.status(400).json({ error: "Ukuran setiap video referensi maksimal 100 MB." });
       const seconds = readMp4DurationSeconds(videoBuffer);
-      if (!Number.isFinite(seconds) || seconds < 2 || seconds > 15) {
-        return res.status(400).json({ error: "Setiap video referensi MiniMax harus berdurasi 2–15 detik dan dapat dibaca." });
-      }
+      if (!Number.isFinite(seconds) || seconds < 2 || seconds > 15) return res.status(400).json({ error: "Setiap video referensi MiniMax harus berdurasi 2–15 detik dan dapat dibaca." });
       totalReferenceVideoSeconds += seconds;
       const tokensPerSecond = resolution === "480p" ? 2886 : 7459;
       referenceTokens += Math.ceil(seconds * tokensPerSecond);
     }
 
-    if (totalReferenceVideoSeconds > 15) {
-      return res.status(400).json({ error: "Total durasi video referensi MiniMax maksimal 15 detik." });
-    }
-
+    if (totalReferenceVideoSeconds > 15) return res.status(400).json({ error: "Total durasi video referensi MiniMax maksimal 15 detik." });
     const extraTokens = Math.max(0, referenceTokens - 4096);
-    // Combine output and reference API costs first, then apply the 30% margin and round once.
     const outputRates = { "480p": 0.05, "768p": 0.08, "1080p": 0.16 };
     const outputRate = outputRates[resolution];
     const referenceCostUsd = (extraTokens / 1000) * 0.02;
     const totalCostUsd = outputRate * videoDuration + referenceCostUsd;
     creditAmount = Number.isFinite(outputRate) ? Math.ceil(totalCostUsd * 130) : null;
-    if (!creditAmount) {
-      return res.status(400).json({ error: "Kombinasi resolusi dan biaya referensi tidak tersedia." });
-    }
+    if (!creditAmount) return res.status(400).json({ error: "Kombinasi resolusi dan biaya referensi tidak tersedia." });
   }
 
+  referenceImageUrls = referenceImageTickets.map(ticket => ticket.url);
+  referenceVideoUrls = referenceVideoTickets.map(ticket => ticket.url);
+
   const uploadReference = async (dataUrl, allowedTypes) => {
-    if (typeof dataUrl !== "string") {
-      throw new Error("Data referensi tidak valid.");
-    }
-
-    const match = dataUrl.match(
-      /^data:(image\/[a-zA-Z0-9.+-]+|video\/[a-zA-Z0-9.+-]+);base64,(.+)$/
-    );
-
-    if (!match || !allowedTypes.includes(match[1])) {
-      throw new Error("Format file referensi tidak didukung.");
-    }
-
+    if (typeof dataUrl !== "string") throw new Error("Data referensi tidak valid.");
+    const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+|video\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (!match || !allowedTypes.includes(match[1])) throw new Error("Format file referensi tidak didukung.");
     const buffer = Buffer.from(match[2], "base64");
     const isVideo = match[1].startsWith("video/");
     const maxBytes = isVideo ? 100 * 1024 * 1024 : 10 * 1024 * 1024;
-
-    if (buffer.length === 0 || buffer.length > maxBytes) {
-      throw new Error(
-        isVideo
-          ? "Ukuran video referensi maksimal 100 MB."
-          : "Ukuran gambar referensi maksimal 10 MB."
-      );
-    }
-
+    if (buffer.length === 0 || buffer.length > maxBytes) throw new Error(isVideo ? "Ukuran video referensi maksimal 100 MB." : "Ukuran gambar referensi maksimal 10 MB.");
     const subtype = match[1].split("/")[1].replace("jpeg", "jpg");
-    const file = new File(
-      [buffer],
-      `movira-reference.${subtype}`,
-      { type: match[1] }
-    );
-
+    const file = new File([buffer], `movira-reference.${subtype}`, { type: match[1] });
     return await fal.storage.upload(file);
   };
 
   try {
-    referenceImageUrls = await Promise.all(
-      referenceImages.map(data =>
-        uploadReference(data, [
-          "image/jpeg",
-          "image/png",
-          "image/webp",
-          "image/bmp"
-        ])
-      )
-    );
-
-    referenceVideoUrls = await Promise.all(
-      referenceVideos.map(data =>
-        uploadReference(data, ["video/mp4", "video/quicktime"])
-      )
-    );
+    const legacyImageUrls = await Promise.all(referenceImages.map(data => uploadReference(data, ["image/jpeg", "image/png", "image/webp", "image/bmp"])));
+    const legacyVideoUrls = await Promise.all(referenceVideos.map(data => uploadReference(data, ["video/mp4", "video/quicktime"])));
+    referenceImageUrls.push(...legacyImageUrls);
+    referenceVideoUrls.push(...legacyVideoUrls);
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
 } else if (isVideoToVideoModel) {
-  if (typeof sourceVideo !== "string") {
-    return res.status(400).json({
-      error: "Unggah video sumber terlebih dahulu."
-    });
+  let sourceDurationSeconds = null;
+  const sourceVideoTicket = sourceVideoUploadId ? resolveUploadedMediaTicket(sourceVideoUploadId, user.id, "video") : null;
+  if (sourceVideoUploadId && !sourceVideoTicket) return res.status(400).json({ error: "Unggahan video sumber kedaluwarsa atau bukan milik akun ini. Unggah ulang video." });
+
+  if (sourceVideoTicket) {
+    if (sourceVideoTicket.mimeType !== "video/mp4") return res.status(400).json({ error: "Video sumber harus berformat MP4." });
+    sourceVideoUrl = sourceVideoTicket.url;
+    sourceDurationSeconds = Number(sourceVideoTicket.durationSeconds);
+  } else {
+    if (typeof sourceVideo !== "string") return res.status(400).json({ error: "Unggah video sumber terlebih dahulu." });
+    const videoMatch = sourceVideo.match(/^data:(video\/mp4);base64,(.+)$/);
+    if (!videoMatch) return res.status(400).json({ error: "Format video harus MP4." });
+    const videoBuffer = Buffer.from(videoMatch[2], "base64");
+    if (videoBuffer.length === 0 || videoBuffer.length > 100 * 1024 * 1024) return res.status(400).json({ error: "Ukuran video maksimal 100 MB." });
+    sourceDurationSeconds = (isGeminiEditModel || isMiniMaxReframeModel) ? readMp4DurationSeconds(videoBuffer) : null;
+    const videoFile = new File([videoBuffer], "movira-source.mp4", { type: "video/mp4" });
+    try { sourceVideoUrl = await fal.storage.upload(videoFile); }
+    catch { return res.status(400).json({ error: "Gagal mengunggah video sumber." }); }
   }
 
-  const videoMatch = sourceVideo.match(
-    /^data:(video\/mp4);base64,(.+)$/
-  );
-
-  if (!videoMatch) {
-    return res.status(400).json({
-      error: "Format video harus MP4."
-    });
-  }
-
-  const videoBuffer = Buffer.from(videoMatch[2], "base64");
-
-  if (
-    videoBuffer.length === 0 ||
-    videoBuffer.length > 100 * 1024 * 1024
-  ) {
-    return res.status(400).json({
-      error: "Ukuran video maksimal 100 MB."
-    });
-  }
-
-  const sourceDurationSeconds = (isGeminiEditModel || isMiniMaxReframeModel)
-    ? readMp4DurationSeconds(videoBuffer)
-    : null;
   if (isGeminiEditModel) {
-    if (!Number.isFinite(sourceDurationSeconds) || sourceDurationSeconds <= 0) {
-      return res.status(400).json({
-        error: "Durasi video MP4 tidak dapat dibaca. Coba ekspor ulang video sebagai MP4 standar."
-      });
-    }
-    if (sourceDurationSeconds > videoDuration + 0.01) {
-      return res.status(400).json({
-        error: `Video sumber berdurasi ${sourceDurationSeconds.toFixed(1)} detik, lebih lama dari paket ${videoDuration} detik. Pilih durasi yang mencukupi. Maksimum 10 detik.`
-      });
-    }
-    // Gemini Edit has no duration input: it preserves the source clip length.
-    // fal bills per second of output, so estimate/debit against measured source duration.
+    if (!Number.isFinite(sourceDurationSeconds) || sourceDurationSeconds <= 0) return res.status(400).json({ error: "Durasi video MP4 tidak dapat dibaca. Coba ekspor ulang video sebagai MP4 standar." });
+    if (sourceDurationSeconds > videoDuration + 0.01) return res.status(400).json({ error: `Video sumber berdurasi ${sourceDurationSeconds.toFixed(1)} detik, lebih lama dari paket ${videoDuration} detik. Pilih durasi yang mencukupi. Maksimum 10 detik.` });
     actualVideoDuration = sourceDurationSeconds;
     const outputRate = ({ "360p": 0.03, "720p": 0.10, "1080p": 0.15 })[resolution];
-    creditAmount = Number.isFinite(outputRate)
-      ? Math.ceil(actualVideoDuration * outputRate * 130)
-      : null;
-    if (!Number.isInteger(creditAmount) || creditAmount < 1) {
-      return res.status(400).json({ error: "Durasi atau biaya Gemini Edit tidak valid." });
-    }
+    creditAmount = Number.isFinite(outputRate) ? Math.ceil(actualVideoDuration * outputRate * 130) : null;
+    if (!Number.isInteger(creditAmount) || creditAmount < 1) return res.status(400).json({ error: "Durasi atau biaya Gemini Edit tidak valid." });
   }
   if (isMiniMaxReframeModel) {
-    if (!Number.isFinite(sourceDurationSeconds) || sourceDurationSeconds <= 0) {
-      return res.status(400).json({
-        error: "Durasi video MP4 tidak dapat dibaca. Coba ekspor ulang video sebagai MP4 standar."
-      });
-    }
-    if (sourceDurationSeconds > 15) {
-      return res.status(400).json({
-        error: "MiniMax H3 Max Reframe dibatasi pada video sumber maksimal 15 detik untuk menghindari biaya pemrosesan tambahan yang tidak terduga."
-      });
-    }
+    if (!Number.isFinite(sourceDurationSeconds) || sourceDurationSeconds <= 0) return res.status(400).json({ error: "Durasi video MP4 tidak dapat dibaca. Coba ekspor ulang video sebagai MP4 standar." });
+    if (sourceDurationSeconds > 15) return res.status(400).json({ error: "MiniMax H3 Max Reframe dibatasi pada video sumber maksimal 15 detik untuk menghindari biaya pemrosesan tambahan yang tidak terduga." });
     actualVideoDuration = Math.ceil(sourceDurationSeconds);
     const creditsPerSecond = { "480p": 5, "768p": 8 }[resolution];
     creditAmount = actualVideoDuration * creditsPerSecond;
-    if (!Number.isInteger(creditAmount) || creditAmount < 1) {
-      return res.status(400).json({
-        error: "Kombinasi resolusi dan durasi sumber tidak tersedia."
-      });
-    }
+    if (!Number.isInteger(creditAmount) || creditAmount < 1) return res.status(400).json({ error: "Kombinasi resolusi dan durasi sumber tidak tersedia." });
   }
-
-  const videoFile = new File(
-    [videoBuffer],
-    "movira-source.mp4",
-    { type: "video/mp4" }
-  );
-
-  try {
-    sourceVideoUrl = await fal.storage.upload(videoFile);
-  } catch (error) {
-    return res.status(400).json({
-      error: "Gagal mengunggah video sumber."
-    });
-  }
-
 } else {
   if (!startImageUrl && typeof imageData === "string") {
-    if (!imageData.startsWith("data:image/")) {
-      return res.status(400).json({
-        error: "Format imageData tidak valid."
-      });
-    }
-
-    const match = imageData.match(
-      /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/
-    );
-
-    if (!match) {
-      return res.status(400).json({
-        error: "Data gambar tidak valid."
-      });
-    }
-
+    if (!imageData.startsWith("data:image/")) return res.status(400).json({ error: "Format imageData tidak valid." });
+    const match = imageData.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (!match) return res.status(400).json({ error: "Data gambar tidak valid." });
     const mimeType = match[1];
     const buffer = Buffer.from(match[2], "base64");
-
-    if (buffer.length === 0 || buffer.length > 10 * 1024 * 1024) {
-      return res.status(400).json({
-        error: "Ukuran gambar maksimal 10 MB."
-      });
-    }
-
+    if (buffer.length === 0 || buffer.length > 10 * 1024 * 1024) return res.status(400).json({ error: "Ukuran gambar maksimal 10 MB." });
     const extension = mimeType.split("/")[1].replace("jpeg", "jpg");
-    const file = new File(
-      [buffer],
-      `movira-input.${extension}`,
-      { type: mimeType }
-    );
-
+    const file = new File([buffer], `movira-input.${extension}`, { type: mimeType });
     startImageUrl = await fal.storage.upload(file);
   }
+  if (!startImageUrl || typeof startImageUrl !== "string") return res.status(400).json({ error: "Gambar wajib diberikan." });
+}
 
-  if (!startImageUrl || typeof startImageUrl !== "string") {
-    return res.status(400).json({
-      error: "Gambar wajib diberikan."
-    });
-  }
-     }  
 
 creditAmountToRefund = creditAmount;
 creditRequestId = randomUUID();
@@ -1547,7 +1672,6 @@ const falInput = isSeedanceReferenceModel
       video_url: sourceVideoUrl,
       prompt: prompt.trim(),
       resolution,
-      aspect_ratio: ratio,
       num_frames: Math.round(videoDuration * 16),
       frames_per_second: 16,
       num_inference_steps: 27,
@@ -1641,25 +1765,18 @@ const result = await fal.subscribe(model, {
  onEnqueue: (requestId) => {
   falRequestId = requestId;
   console.log("Fal request ID:", falRequestId);
-
-  void supabase
-    .from("video_generation_requests")
-    .update({
-      fal_request_id: requestId,
-      status: "processing"
-    })
-    .eq("credit_request_id", creditRequestId)
-.in("status", ["submitted", "processing"])
-    .then(({ error }) => {
-      if (error) {
-        console.error(
-          "Gagal memperbarui status permintaan video:",
-          error
-        );
-      }
-    });
- } 
+  falRequestPersistPromise = (async () => {
+    const { error } = await supabase
+      .from("video_generation_requests")
+      .update({ fal_request_id: requestId, status: "processing" })
+      .eq("credit_request_id", creditRequestId)
+      .in("status", ["submitted", "processing"]);
+    return error || null;
+  })();
+ }
  });
+    const falRequestPersistError = await falRequestPersistPromise;
+    if (falRequestPersistError) throw falRequestPersistError;
     const videoUrl =
   result.data?.video?.url ||
   result.data?.video?.video_url ||
@@ -1688,7 +1805,8 @@ const { error: historyError } = await supabase
     });
 
 if (historyError) {
-  console.error("Gagal menyimpan riwayat video:", historyError);
+  console.error("Gagal menyimpan riwayat video; hasil akan dicoba dipulihkan:", historyError);
+  throw new Error("Video selesai dibuat, tetapi riwayat belum tersimpan. Sistem akan mencoba memulihkan hasil; jangan kirim Generate ulang.");
 }
 const { error: requestUpdateError } = await supabase
   .from("video_generation_requests")
@@ -1704,6 +1822,7 @@ if (requestUpdateError) {
     "Gagal memperbarui status permintaan video:",
     requestUpdateError
   );
+  throw new Error("Riwayat video tersimpan, tetapi status permintaan belum tersimpan. Sistem akan mencoba memulihkan status; jangan kirim Generate ulang.");
 }
 return res.json({
   ok: true,
@@ -1843,6 +1962,15 @@ if (falStatus.status === "COMPLETED") {
 
       console.log("Hasil fal.ai berhasil dipulihkan.", {
         requestId: falRequestId
+      });
+      return res.json({
+        ok: true,
+        recovered: true,
+        requestId: falRequestId,
+        video: falResult.data?.video || { url: recoveredVideoUrl },
+        seed: falResult.data?.seed ?? null,
+        duration: falResult.data?.duration ?? recoveryData.duration,
+        actualPrompt: falResult.data?.actual_prompt ?? null
       });
     }
   } catch (resultError) {
@@ -2032,7 +2160,26 @@ app.use((_req, res) => {
   });
 });
 
-
+app.use((error, _req, res, _next) => {
+  if (error instanceof multer.MulterError) {
+    const tooLarge = error.code === "LIMIT_FILE_SIZE";
+    return res.status(tooLarge ? 413 : 400).json({
+      error: tooLarge
+        ? "Ukuran file melebihi batas: gambar maksimal 10 MB dan video maksimal 100 MB."
+        : "Format atau jumlah file unggahan tidak sesuai. Unggah satu file pada satu waktu."
+    });
+  }
+  if (error?.status === 413 || error?.type === "entity.too.large") {
+    return res.status(413).json({
+      error: "Ukuran total permintaan terlalu besar. Untuk sementara, satu gambar/video maksimal 10 MB dan total file referensi maksimal 10 MB."
+    });
+  }
+  if (error instanceof SyntaxError && Object.prototype.hasOwnProperty.call(error, "body")) {
+    return res.status(400).json({ error: "Format data permintaan tidak valid." });
+  }
+  console.error("Unhandled backend error:", error);
+  return res.status(500).json({ error: "Terjadi kesalahan pada server." });
+});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Movira backend berjalan di port ${PORT}`);
